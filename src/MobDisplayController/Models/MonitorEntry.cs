@@ -14,6 +14,9 @@ public sealed class MonitorEntry
     public required string FriendlyName { get; init; }
     public required bool IsActive { get; init; }
 
+    /// <summary>True for the laptop/handheld's built-in panel (internal or embedded DisplayPort output).</summary>
+    public required bool IsInternal { get; init; }
+
     /// <summary>GDI device name such as \\.\DISPLAY1. Only populated when IsActive is true.</summary>
     public string? GdiDeviceName { get; init; }
 

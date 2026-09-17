@@ -27,6 +27,10 @@ public sealed class DisplayService
             if (isActive)
                 gdiName = GetSourceGdiDeviceName(path.sourceInfo.adapterId, path.sourceInfo.id);
 
+            bool isInternal = path.targetInfo.outputTechnology
+                is DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY.DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INTERNAL
+                or DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY.DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_EMBEDDED;
+
             result.Add(new MonitorEntry
             {
                 AdapterLuidLow = path.targetInfo.adapterId.LowPart,
@@ -35,6 +39,7 @@ public sealed class DisplayService
                 TargetId = path.targetInfo.id,
                 FriendlyName = friendlyName,
                 IsActive = isActive,
+                IsInternal = isInternal,
                 GdiDeviceName = gdiName,
             });
         }

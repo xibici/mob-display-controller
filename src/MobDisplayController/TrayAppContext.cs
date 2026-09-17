@@ -435,10 +435,27 @@ public sealed class TrayAppContext : ApplicationContext
         }
 
         var filter = _settings.TargetMonitorNameFilter;
-        if (string.IsNullOrWhiteSpace(filter))
-            return null;
+        if (!string.IsNullOrWhiteSpace(filter))
+        {
+            var byName = monitors.FirstOrDefault(m => m.FriendlyName.Contains(filter, StringComparison.OrdinalIgnoreCase));
+            if (byName is not null)
+                return byName;
+        }
 
-        return monitors.FirstOrDefault(m => m.FriendlyName.Contains(filter, StringComparison.OrdinalIgnoreCase));
+        // Name-based matching fails for monitors whose EDID friendly name doesn't
+        // actually contain "DP" (e.g. some DP-connected panels report themselves as
+        // "HDMI"). If there's exactly one non-built-in display, it's unambiguous -
+        // use it and remember its exact ID so future lookups no longer depend on the name.
+        var externalCandidates = monitors.Where(m => !m.IsInternal).ToList();
+        if (externalCandidates.Count == 1)
+        {
+            var external = externalCandidates[0];
+            _settings.TargetMonitorKey = external.Key;
+            _settings.Save();
+            return external;
+        }
+
+        return null;
     }
 
     private void OpenSettings()
