@@ -1,5 +1,6 @@
 using Microsoft.Win32;
 using MobDisplayController.Models;
+using MobDisplayController.Native;
 using MobDisplayController.Services;
 using MobDisplayController.UI;
 
@@ -22,6 +23,7 @@ public sealed class TrayAppContext : ApplicationContext
     private ToolStripMenuItem _connectToggleItem = new();
     private ToolStripMenuItem _displayModeMenuItem = new();
     private ToolStripMenuItem _resolutionMenuItem = new();
+    private ToolStripMenuItem _rotationMenuItem = new();
     private ToolStripMenuItem _brightnessMenuItem = new();
     private ToolStripMenuItem _volumeMenuItem = new();
     private ToolStripMenuItem _startupMenuItem = new();
@@ -81,6 +83,7 @@ public sealed class TrayAppContext : ApplicationContext
         _menu.Items.Add(_connectToggleItem);
         _menu.Items.Add(_displayModeMenuItem);
         _menu.Items.Add(_resolutionMenuItem);
+        _menu.Items.Add(_rotationMenuItem);
         _menu.Items.Add(_brightnessMenuItem);
         _menu.Items.Add(_volumeMenuItem);
         _menu.Items.Add(new ToolStripSeparator());
@@ -112,6 +115,8 @@ public sealed class TrayAppContext : ApplicationContext
             _displayModeMenuItem.DropDownItems.Clear();
             _resolutionMenuItem.Enabled = false;
             _resolutionMenuItem.DropDownItems.Clear();
+            _rotationMenuItem.Enabled = false;
+            _rotationMenuItem.DropDownItems.Clear();
             _brightnessMenuItem.Enabled = false;
             _brightnessMenuItem.DropDownItems.Clear();
             _volumeMenuItem.Enabled = false;
@@ -128,6 +133,7 @@ public sealed class TrayAppContext : ApplicationContext
 
         BuildDisplayModeSubmenu(target);
         BuildResolutionSubmenu(target);
+        BuildRotationSubmenu(target);
         BuildBrightnessSubmenu(target);
         BuildVolumeSubmenu(target);
     }
@@ -229,6 +235,47 @@ public sealed class TrayAppContext : ApplicationContext
     {
         (1920, 1080),
         (1920, 1200),
+    };
+
+    private void BuildRotationSubmenu(MonitorEntry target)
+    {
+        _rotationMenuItem.DropDownItems.Clear();
+        _rotationMenuItem.Text = "旋转";
+
+        if (!target.IsActive || target.GdiDeviceName is null)
+        {
+            _rotationMenuItem.Enabled = false;
+            return;
+        }
+
+        var current = _displayService.GetCurrentOrientation(target.GdiDeviceName);
+        if (current is null)
+        {
+            _rotationMenuItem.Enabled = false;
+            return;
+        }
+
+        _rotationMenuItem.Enabled = true;
+
+        foreach (var (label, orientation) in RotationOptions)
+        {
+            var item = new ToolStripMenuItem(label) { Checked = current == orientation };
+            item.Click += (_, _) =>
+            {
+                if (!_displayService.TrySetOrientation(target.GdiDeviceName!, orientation, out var err) && err.Length > 0)
+                    ShowBalloon("设置旋转失败", err, ToolTipIcon.Error);
+                RefreshMenu();
+            };
+            _rotationMenuItem.DropDownItems.Add(item);
+        }
+    }
+
+    private static readonly (string Label, int Orientation)[] RotationOptions =
+    {
+        ("0°(横向)", Gdi.DMDO_DEFAULT),
+        ("90°", Gdi.DMDO_90),
+        ("180°(横向翻转)", Gdi.DMDO_180),
+        ("270°", Gdi.DMDO_270),
     };
 
     private void BuildBrightnessSubmenu(MonitorEntry target)

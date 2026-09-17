@@ -300,6 +300,12 @@ internal static class Gdi
     public const int DM_PELSHEIGHT = 0x100000;
     public const int DM_DISPLAYFREQUENCY = 0x400000;
     public const int DM_BITSPERPEL = 0x40000;
+    public const int DM_DISPLAYORIENTATION = 0x00000080;
+
+    public const int DMDO_DEFAULT = 0;
+    public const int DMDO_90 = 1;
+    public const int DMDO_180 = 2;
+    public const int DMDO_270 = 3;
 
     public const int CDS_UPDATEREGISTRY = 0x00000001;
     public const int CDS_TEST = 0x00000002;
