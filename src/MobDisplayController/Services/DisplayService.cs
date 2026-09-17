@@ -216,47 +216,61 @@ public sealed class DisplayService
         return rc == Gdi.DISP_CHANGE_RESTART; // restart-required still counts as "applied"
     }
 
-    /// <summary>Returns the monitor's current rotation as one of Gdi.DMDO_DEFAULT/90/180/270.</summary>
-    public int? GetCurrentOrientation(string gdiDeviceName)
+    /// <summary>Returns this monitor's own rotation as recorded on its CCD display path.</summary>
+    public DISPLAYCONFIG_ROTATION? GetCurrentOrientation(MonitorEntry monitor)
     {
-        var devMode = new DEVMODE { dmSize = (short)System.Runtime.InteropServices.Marshal.SizeOf<DEVMODE>() };
-        if (!Gdi.EnumDisplaySettingsEx(gdiDeviceName, Gdi.ENUM_CURRENT_SETTINGS, ref devMode, 0))
+        if (!TryQueryPaths(Ccd.QDC_ONLY_ACTIVE_PATHS, out var paths, out _))
             return null;
-        return devMode.dmDisplayOrientation;
+
+        int idx = Array.FindIndex(paths, p =>
+            p.targetInfo.adapterId.LowPart == monitor.AdapterLuidLow &&
+            p.targetInfo.adapterId.HighPart == monitor.AdapterLuidHigh &&
+            p.targetInfo.id == monitor.TargetId);
+
+        return idx >= 0 ? paths[idx].targetInfo.rotation : null;
     }
 
-    /// <summary>Sets display orientation (0/90/180/270), same as the "显示方向" dropdown in Windows Settings.</summary>
-    public bool TrySetOrientation(string gdiDeviceName, int orientation, out string error)
+    /// <summary>
+    /// Rotates only this monitor's own display path. Unlike the legacy DEVMODE orientation
+    /// API (which rotates the shared source mode), this touches only the one CCD path, so a
+    /// display cloned with another one won't drag it along - the classic symptom being "I
+    /// rotated the external screen and the built-in one rotated too" when using Duplicate mode.
+    /// </summary>
+    public bool TrySetOrientation(MonitorEntry monitor, DISPLAYCONFIG_ROTATION rotation, out string error)
     {
         error = string.Empty;
-        var devMode = new DEVMODE { dmSize = (short)System.Runtime.InteropServices.Marshal.SizeOf<DEVMODE>() };
 
-        if (!Gdi.EnumDisplaySettingsEx(gdiDeviceName, Gdi.ENUM_CURRENT_SETTINGS, ref devMode, 0))
+        if (!TryQueryAllPaths(out var paths, out var modes))
         {
-            error = "无法读取当前显示模式。";
+            error = "无法读取当前显示器配置 (QueryDisplayConfig 失败)。";
             return false;
         }
 
-        // Rotating by 90 or 270 relative to the current orientation swaps portrait/landscape,
-        // so width/height must be swapped too or ChangeDisplaySettingsEx will reject the mode.
-        int delta = ((orientation - devMode.dmDisplayOrientation) % 4 + 4) % 4;
-        if (delta == 1 || delta == 3)
-            (devMode.dmPelsWidth, devMode.dmPelsHeight) = (devMode.dmPelsHeight, devMode.dmPelsWidth);
+        int idx = Array.FindIndex(paths, p =>
+            p.targetInfo.adapterId.LowPart == monitor.AdapterLuidLow &&
+            p.targetInfo.adapterId.HighPart == monitor.AdapterLuidHigh &&
+            p.targetInfo.id == monitor.TargetId);
 
-        devMode.dmDisplayOrientation = orientation;
-        devMode.dmFields = Gdi.DM_DISPLAYORIENTATION | Gdi.DM_PELSWIDTH | Gdi.DM_PELSHEIGHT;
+        if (idx < 0)
+        {
+            error = "找不到该显示器,可能已被物理拔出。";
+            return false;
+        }
 
-        int rc = Gdi.ChangeDisplaySettingsEx(gdiDeviceName, ref devMode, IntPtr.Zero, Gdi.CDS_UPDATEREGISTRY, IntPtr.Zero);
-        if (rc == Gdi.DISP_CHANGE_SUCCESSFUL)
+        var target = paths[idx];
+        target.targetInfo.rotation = rotation;
+        paths[idx] = target;
+
+        int rc = Ccd.SetDisplayConfig(
+            (uint)paths.Length, paths,
+            (uint)modes.Length, modes,
+            Ccd.SDC_APPLY | Ccd.SDC_USE_SUPPLIED_DISPLAY_CONFIG | Ccd.SDC_SAVE_TO_DATABASE | Ccd.SDC_ALLOW_CHANGES);
+
+        if (rc == Ccd.ERROR_SUCCESS)
             return true;
 
-        error = rc switch
-        {
-            Gdi.DISP_CHANGE_BADMODE => "该显示器不支持此旋转方向。",
-            Gdi.DISP_CHANGE_RESTART => "需要重启才能生效。",
-            _ => $"设置旋转失败,错误码 {rc}。",
-        };
-        return rc == Gdi.DISP_CHANGE_RESTART; // restart-required still counts as "applied"
+        error = $"设置旋转失败,错误码 {rc}。";
+        return false;
     }
 
     private static bool TryQueryAllPaths(out DISPLAYCONFIG_PATH_INFO[] paths, out DISPLAYCONFIG_MODE_INFO[] modes)

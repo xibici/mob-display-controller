@@ -242,13 +242,13 @@ public sealed class TrayAppContext : ApplicationContext
         _rotationMenuItem.DropDownItems.Clear();
         _rotationMenuItem.Text = "旋转";
 
-        if (!target.IsActive || target.GdiDeviceName is null)
+        if (!target.IsActive)
         {
             _rotationMenuItem.Enabled = false;
             return;
         }
 
-        var current = _displayService.GetCurrentOrientation(target.GdiDeviceName);
+        var current = _displayService.GetCurrentOrientation(target);
         if (current is null)
         {
             _rotationMenuItem.Enabled = false;
@@ -257,12 +257,12 @@ public sealed class TrayAppContext : ApplicationContext
 
         _rotationMenuItem.Enabled = true;
 
-        foreach (var (label, orientation) in RotationOptions)
+        foreach (var (label, rotation) in RotationOptions)
         {
-            var item = new ToolStripMenuItem(label) { Checked = current == orientation };
+            var item = new ToolStripMenuItem(label) { Checked = current == rotation };
             item.Click += (_, _) =>
             {
-                if (!_displayService.TrySetOrientation(target.GdiDeviceName!, orientation, out var err) && err.Length > 0)
+                if (!_displayService.TrySetOrientation(target, rotation, out var err) && err.Length > 0)
                     ShowBalloon("设置旋转失败", err, ToolTipIcon.Error);
                 RefreshMenu();
             };
@@ -270,12 +270,12 @@ public sealed class TrayAppContext : ApplicationContext
         }
     }
 
-    private static readonly (string Label, int Orientation)[] RotationOptions =
+    private static readonly (string Label, DISPLAYCONFIG_ROTATION Rotation)[] RotationOptions =
     {
-        ("0°(横向)", Gdi.DMDO_DEFAULT),
-        ("90°", Gdi.DMDO_90),
-        ("180°(横向翻转)", Gdi.DMDO_180),
-        ("270°", Gdi.DMDO_270),
+        ("0°(默认方向)", DISPLAYCONFIG_ROTATION.DISPLAYCONFIG_ROTATION_IDENTITY),
+        ("90°", DISPLAYCONFIG_ROTATION.DISPLAYCONFIG_ROTATION_ROTATE90),
+        ("180°(翻转)", DISPLAYCONFIG_ROTATION.DISPLAYCONFIG_ROTATION_ROTATE180),
+        ("270°", DISPLAYCONFIG_ROTATION.DISPLAYCONFIG_ROTATION_ROTATE270),
     };
 
     private void BuildBrightnessSubmenu(MonitorEntry target)
