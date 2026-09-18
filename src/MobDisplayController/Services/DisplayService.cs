@@ -50,9 +50,10 @@ public sealed class DisplayService
     public enum TopologyMode
     {
         Unknown,
-        Single,
         Clone,
         Extend,
+        InternalOnly,
+        ExternalOnly,
     }
 
     /// <summary>
@@ -64,8 +65,16 @@ public sealed class DisplayService
         if (!TryQueryPaths(Ccd.QDC_ONLY_ACTIVE_PATHS, out var paths, out _))
             return TopologyMode.Unknown;
 
-        if (paths.Length <= 1)
-            return TopologyMode.Single;
+        if (paths.Length == 0)
+            return TopologyMode.Unknown;
+
+        if (paths.Length == 1)
+        {
+            bool isInternal = paths[0].targetInfo.outputTechnology
+                is DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY.DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INTERNAL
+                or DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY.DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_EMBEDDED;
+            return isInternal ? TopologyMode.InternalOnly : TopologyMode.ExternalOnly;
+        }
 
         int distinctSources = paths
             .Select(p => (p.sourceInfo.adapterId.LowPart, p.sourceInfo.adapterId.HighPart, p.sourceInfo.id))
@@ -84,6 +93,8 @@ public sealed class DisplayService
         {
             TopologyMode.Clone => Ccd.SDC_TOPOLOGY_CLONE,
             TopologyMode.Extend => Ccd.SDC_TOPOLOGY_EXTEND,
+            TopologyMode.InternalOnly => Ccd.SDC_TOPOLOGY_INTERNAL,
+            TopologyMode.ExternalOnly => Ccd.SDC_TOPOLOGY_EXTERNAL,
             _ => 0,
         };
 
@@ -240,7 +251,19 @@ public sealed class DisplayService
     {
         error = string.Empty;
 
-        if (!TryQueryAllPaths(out var paths, out var modes))
+        // Two cloned targets share one source mode, and Windows can't honor different
+        // rotations for each - rather than failing cleanly it can silently drop the target's
+        // path from the topology instead. Only ever touch an already-active, non-cloned path.
+        if (GetTopologyMode() == TopologyMode.Clone)
+        {
+            error = "复制模式下无法单独旋转某一块屏幕,请先切换到扩展模式。";
+            return false;
+        }
+
+        // Scoped to only-active paths (rather than the full historical QDC_ALL_PATHS database)
+        // to keep the array SetDisplayConfig has to re-validate small - rotation only ever
+        // applies to a monitor that's already active anyway.
+        if (!TryQueryPaths(Ccd.QDC_ONLY_ACTIVE_PATHS, out var paths, out var modes))
         {
             error = "无法读取当前显示器配置 (QueryDisplayConfig 失败)。";
             return false;

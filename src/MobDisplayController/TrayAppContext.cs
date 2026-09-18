@@ -163,8 +163,23 @@ public sealed class TrayAppContext : ApplicationContext
         };
         extendItem.Click += (_, _) => ApplyTopology(DisplayService.TopologyMode.Extend);
 
+        var externalOnlyItem = new ToolStripMenuItem("仅外接屏 (关闭内置屏)")
+        {
+            Checked = currentMode == DisplayService.TopologyMode.ExternalOnly,
+        };
+        externalOnlyItem.Click += (_, _) => ApplyTopology(DisplayService.TopologyMode.ExternalOnly);
+
+        var internalOnlyItem = new ToolStripMenuItem("仅内置屏 (关闭外接屏)")
+        {
+            Checked = currentMode == DisplayService.TopologyMode.InternalOnly,
+        };
+        internalOnlyItem.Click += (_, _) => ApplyTopology(DisplayService.TopologyMode.InternalOnly);
+
         _displayModeMenuItem.DropDownItems.Add(cloneItem);
         _displayModeMenuItem.DropDownItems.Add(extendItem);
+        _displayModeMenuItem.DropDownItems.Add(new ToolStripSeparator());
+        _displayModeMenuItem.DropDownItems.Add(externalOnlyItem);
+        _displayModeMenuItem.DropDownItems.Add(internalOnlyItem);
     }
 
     private void ApplyTopology(DisplayService.TopologyMode mode)
@@ -245,6 +260,16 @@ public sealed class TrayAppContext : ApplicationContext
         if (!target.IsActive)
         {
             _rotationMenuItem.Enabled = false;
+            return;
+        }
+
+        // In Duplicate/clone mode this monitor shares its source mode with another display.
+        // Windows can't give two cloned targets different rotations, and asking it to try
+        // doesn't fail cleanly - it can silently drop this target's path entirely instead.
+        if (_displayService.GetTopologyMode() == DisplayService.TopologyMode.Clone)
+        {
+            _rotationMenuItem.Enabled = false;
+            _rotationMenuItem.DropDownItems.Add(new ToolStripMenuItem("复制模式下无法单独旋转,请先切换到扩展模式") { Enabled = false });
             return;
         }
 
