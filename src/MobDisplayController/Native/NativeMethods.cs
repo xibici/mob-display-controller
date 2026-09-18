@@ -387,19 +387,19 @@ internal static class MonitorApi
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     public static extern bool GetMonitorInfo(IntPtr hMonitor, ref MONITORINFOEX lpmi);
 
-    [DllImport("dxva2.dll")]
+    [DllImport("dxva2.dll", SetLastError = true)]
     public static extern bool GetNumberOfPhysicalMonitorsFromHMONITOR(IntPtr hMonitor, out uint pdwNumberOfPhysicalMonitors);
 
-    [DllImport("dxva2.dll", CharSet = CharSet.Unicode)]
+    [DllImport("dxva2.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     public static extern bool GetPhysicalMonitorsFromHMONITOR(IntPtr hMonitor, uint dwPhysicalMonitorArraySize, [Out] PHYSICAL_MONITOR[] pPhysicalMonitorArray);
 
     [DllImport("dxva2.dll")]
     public static extern bool DestroyPhysicalMonitors(uint dwPhysicalMonitorArraySize, [In] PHYSICAL_MONITOR[] pPhysicalMonitorArray);
 
-    [DllImport("dxva2.dll")]
+    [DllImport("dxva2.dll", SetLastError = true)]
     public static extern bool GetVCPFeatureAndVCPFeatureReply(IntPtr hMonitor, byte bVCPCode, IntPtr pvct, out uint pdwCurrentValue, out uint pdwMaximumValue);
 
-    [DllImport("dxva2.dll")]
+    [DllImport("dxva2.dll", SetLastError = true)]
     public static extern bool SetVCPFeature(IntPtr hMonitor, byte bVCPCode, uint dwNewValue);
 
     // VESA MCCS VCP codes

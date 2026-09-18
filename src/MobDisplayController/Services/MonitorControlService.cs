@@ -1,3 +1,5 @@
+using System.Linq;
+using System.Runtime.InteropServices;
 using MobDisplayController.Native;
 
 namespace MobDisplayController.Services;
@@ -35,14 +37,30 @@ public sealed class MonitorControlService
         }, IntPtr.Zero);
 
         if (hMonitor is null)
+        {
+            DebugLog.Write($"DDC/CI[{gdiDeviceName}]: EnumDisplayMonitors found no HMONITOR matching this GDI name");
             return null;
+        }
 
-        if (!MonitorApi.GetNumberOfPhysicalMonitorsFromHMONITOR(hMonitor.Value, out uint count) || count == 0)
+        if (!MonitorApi.GetNumberOfPhysicalMonitorsFromHMONITOR(hMonitor.Value, out uint count))
+        {
+            DebugLog.Write($"DDC/CI[{gdiDeviceName}]: GetNumberOfPhysicalMonitorsFromHMONITOR failed, err={Marshal.GetLastWin32Error()}");
             return null;
+        }
+        if (count == 0)
+        {
+            DebugLog.Write($"DDC/CI[{gdiDeviceName}]: GetNumberOfPhysicalMonitorsFromHMONITOR reports 0 physical monitors");
+            return null;
+        }
 
         var physicalMonitors = new PHYSICAL_MONITOR[count];
         if (!MonitorApi.GetPhysicalMonitorsFromHMONITOR(hMonitor.Value, count, physicalMonitors))
+        {
+            DebugLog.Write($"DDC/CI[{gdiDeviceName}]: GetPhysicalMonitorsFromHMONITOR failed (count={count}), err={Marshal.GetLastWin32Error()}");
             return null;
+        }
+
+        DebugLog.Write($"DDC/CI[{gdiDeviceName}]: got {count} physical monitor handle(s), description(s): {string.Join(", ", physicalMonitors.Select(m => $"'{m.szPhysicalMonitorDescription}'"))}");
 
         // Use the first physical monitor behind this logical monitor.
         var handle = physicalMonitors[0].hPhysicalMonitor;
@@ -64,24 +82,26 @@ public sealed class MonitorControlService
     }
 
     public bool TryGetBrightness(IntPtr handle, out uint current, out uint max)
-    {
-        current = 0;
-        max = 100;
-        return MonitorApi.GetVCPFeatureAndVCPFeatureReply(handle, MonitorApi.VCP_BRIGHTNESS, IntPtr.Zero, out current, out max);
-    }
+        => TryGetVcp(handle, MonitorApi.VCP_BRIGHTNESS, "亮度", out current, out max);
 
     public bool TrySetBrightness(IntPtr handle, uint value)
         => MonitorApi.SetVCPFeature(handle, MonitorApi.VCP_BRIGHTNESS, value);
 
     public bool TryGetVolume(IntPtr handle, out uint current, out uint max)
-    {
-        current = 0;
-        max = 100;
-        return MonitorApi.GetVCPFeatureAndVCPFeatureReply(handle, MonitorApi.VCP_AUDIO_VOLUME, IntPtr.Zero, out current, out max);
-    }
+        => TryGetVcp(handle, MonitorApi.VCP_AUDIO_VOLUME, "音量", out current, out max);
 
     public bool TrySetVolume(IntPtr handle, uint value)
         => MonitorApi.SetVCPFeature(handle, MonitorApi.VCP_AUDIO_VOLUME, value);
+
+    private static bool TryGetVcp(IntPtr handle, byte vcpCode, string label, out uint current, out uint max)
+    {
+        current = 0;
+        max = 100;
+        bool ok = MonitorApi.GetVCPFeatureAndVCPFeatureReply(handle, vcpCode, IntPtr.Zero, out current, out max);
+        if (!ok)
+            DebugLog.Write($"DDC/CI: GetVCPFeatureAndVCPFeatureReply({label}, code=0x{vcpCode:X2}) failed, err={Marshal.GetLastWin32Error()}");
+        return ok;
+    }
 
     /// <summary>Sends the DDC/CI "power off" VCP command (0xD6 = 4/5), a soft power-down distinct from disconnecting the display in Windows.</summary>
     public bool TryPowerOff(IntPtr handle)
