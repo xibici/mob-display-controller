@@ -410,3 +410,55 @@ internal static class MonitorApi
 }
 
 #endregion
+
+#region Power button takeover (RegisterPowerSettingNotification + power scheme APIs)
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct POWERBROADCAST_SETTING
+{
+    public Guid PowerSetting;
+    public uint DataLength;
+    public byte Data;
+}
+
+internal static class Power
+{
+    public const int WM_POWERBROADCAST = 0x0218;
+    public const int PBT_POWERSETTINGCHANGE = 0x8013;
+    public const int DEVICE_NOTIFY_WINDOW_HANDLE = 0;
+
+    /// <summary>SUB_BUTTONS: the "power and sleep buttons and lid" power settings subgroup.</summary>
+    public static readonly Guid GUID_BUTTONS_SUBGROUP = new("4f971e89-eebd-4455-a8de-9e59040e7347");
+
+    /// <summary>PBUTTONACTION: what pressing the physical power button does. 0 = do nothing, 1 = sleep, 2 = hibernate, 3 = shut down.</summary>
+    public static readonly Guid GUID_POWERBUTTON_ACTION = new("7648efa3-dd9c-4e3e-b566-50f929386280");
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern IntPtr RegisterPowerSettingNotification(IntPtr hRecipient, ref Guid PowerSettingGuid, int Flags);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool UnregisterPowerSettingNotification(IntPtr handle);
+
+    [DllImport("powrprof.dll")]
+    public static extern uint PowerGetActiveScheme(IntPtr UserRootPowerKey, out IntPtr ActivePolicyGuid);
+
+    [DllImport("powrprof.dll")]
+    public static extern uint PowerSetActiveScheme(IntPtr UserRootPowerKey, ref Guid SchemeGuid);
+
+    [DllImport("powrprof.dll")]
+    public static extern uint PowerReadACValueIndex(IntPtr RootPowerKey, ref Guid SchemeGuid, ref Guid SubGroupOfPowerSettingsGuid, ref Guid PowerSettingGuid, out uint AcValueIndex);
+
+    [DllImport("powrprof.dll")]
+    public static extern uint PowerReadDCValueIndex(IntPtr RootPowerKey, ref Guid SchemeGuid, ref Guid SubGroupOfPowerSettingsGuid, ref Guid PowerSettingGuid, out uint DcValueIndex);
+
+    [DllImport("powrprof.dll")]
+    public static extern uint PowerWriteACValueIndex(IntPtr RootPowerKey, ref Guid SchemeGuid, ref Guid SubGroupOfPowerSettingsGuid, ref Guid PowerSettingGuid, uint AcValueIndex);
+
+    [DllImport("powrprof.dll")]
+    public static extern uint PowerWriteDCValueIndex(IntPtr RootPowerKey, ref Guid SchemeGuid, ref Guid SubGroupOfPowerSettingsGuid, ref Guid PowerSettingGuid, uint DcValueIndex);
+
+    [DllImport("kernel32.dll")]
+    public static extern IntPtr LocalFree(IntPtr hMem);
+}
+
+#endregion

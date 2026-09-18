@@ -17,7 +17,10 @@ public sealed class TrayAppContext : ApplicationContext
     private readonly DisplayService _displayService = new();
     private readonly MonitorControlService _monitorControlService = new();
     private readonly StartupService _startupService = new();
+    private readonly PowerButtonService _powerButtonService = new();
     private readonly AppSettings _settings = AppSettings.Load();
+
+    private DisplayService.TopologyMode? _topologyBeforeScreenOff;
 
     private ToolStripMenuItem _statusItem = new();
     private ToolStripMenuItem _connectToggleItem = new();
@@ -27,6 +30,7 @@ public sealed class TrayAppContext : ApplicationContext
     private ToolStripMenuItem _brightnessMenuItem = new();
     private ToolStripMenuItem _volumeMenuItem = new();
     private ToolStripMenuItem _startupMenuItem = new();
+    private ToolStripMenuItem _powerButtonTakeoverMenuItem = new();
 
     private SettingsForm? _settingsForm;
 
@@ -49,6 +53,10 @@ public sealed class TrayAppContext : ApplicationContext
 
         // Reconcile the on-disk autostart preference with what's actually in the registry.
         _startupService.SetEnabled(_settings.StartWithWindows);
+
+        _powerButtonService.PowerButtonPressed += OnPowerButtonPressed;
+        if (_settings.PowerButtonTakeoverEnabled)
+            _powerButtonService.StartListening();
     }
 
     private void BuildStaticMenuItems()
@@ -70,6 +78,11 @@ public sealed class TrayAppContext : ApplicationContext
             _settings.Save();
         };
 
+        _powerButtonTakeoverMenuItem.Text = "接管电源键(关内屏时外屏保持开启)";
+        _powerButtonTakeoverMenuItem.CheckOnClick = true;
+        _powerButtonTakeoverMenuItem.Checked = _settings.PowerButtonTakeoverEnabled;
+        _powerButtonTakeoverMenuItem.Click += (_, _) => ApplyPowerButtonTakeover(_powerButtonTakeoverMenuItem.Checked);
+
         var refreshItem = new ToolStripMenuItem("刷新");
         refreshItem.Click += (_, _) => RefreshMenu();
 
@@ -89,6 +102,7 @@ public sealed class TrayAppContext : ApplicationContext
         _menu.Items.Add(new ToolStripSeparator());
         _menu.Items.Add(settingsItem);
         _menu.Items.Add(_startupMenuItem);
+        _menu.Items.Add(_powerButtonTakeoverMenuItem);
         _menu.Items.Add(refreshItem);
         _menu.Items.Add(new ToolStripSeparator());
         _menu.Items.Add(exitItem);
@@ -188,6 +202,64 @@ public sealed class TrayAppContext : ApplicationContext
             ShowBalloon("切换显示模式失败", error, ToolTipIcon.Error);
 
         RefreshMenu();
+    }
+
+    private void ApplyPowerButtonTakeover(bool enable)
+    {
+        if (enable)
+        {
+            // Only remember the pre-takeover action the first time - if the setting
+            // is already ours from a previous session, re-saving it would overwrite
+            // the user's real original action with "do nothing".
+            if (_settings.SavedPowerButtonActionAc is null || _settings.SavedPowerButtonActionDc is null)
+            {
+                var current = _powerButtonService.ReadCurrentAction();
+                if (current is not null)
+                {
+                    _settings.SavedPowerButtonActionAc = current.Value.Ac;
+                    _settings.SavedPowerButtonActionDc = current.Value.Dc;
+                }
+            }
+
+            if (!_powerButtonService.TryEnable(out var error))
+            {
+                ShowBalloon("接管电源键失败", error, ToolTipIcon.Error);
+                _powerButtonTakeoverMenuItem.Checked = false;
+                return;
+            }
+        }
+        else
+        {
+            _powerButtonService.Disable(_settings.SavedPowerButtonActionAc, _settings.SavedPowerButtonActionDc);
+            _settings.SavedPowerButtonActionAc = null;
+            _settings.SavedPowerButtonActionDc = null;
+        }
+
+        _settings.PowerButtonTakeoverEnabled = enable;
+        _settings.Save();
+    }
+
+    /// <summary>
+    /// Fires when the physical power button is pressed while its action is "do nothing".
+    /// Toggles between "external screen only" (internal off, external stays on) and
+    /// whatever topology was active before, instead of Windows' native "turn off all displays".
+    /// </summary>
+    private void OnPowerButtonPressed()
+    {
+        var current = _displayService.GetTopologyMode();
+
+        if (current == DisplayService.TopologyMode.ExternalOnly)
+        {
+            var restoreMode = _topologyBeforeScreenOff ?? DisplayService.TopologyMode.Extend;
+            _displayService.TrySetTopology(restoreMode, out _);
+        }
+        else
+        {
+            _topologyBeforeScreenOff = current;
+            _displayService.TrySetTopology(DisplayService.TopologyMode.ExternalOnly, out _);
+        }
+
+        RefreshMenuSafe();
     }
 
     private void BuildResolutionSubmenu(MonitorEntry target)
@@ -513,6 +585,10 @@ public sealed class TrayAppContext : ApplicationContext
 
     private void ExitApplication()
     {
+        // Only stop listening - leave the power scheme's "do nothing" setting in place,
+        // since the point of the takeover is that it keeps working across app restarts.
+        _powerButtonService.Dispose();
+
         _trayIcon.Visible = false;
         _trayIcon.Dispose();
         Application.Exit();

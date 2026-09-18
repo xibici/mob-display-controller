@@ -13,6 +13,17 @@ public sealed class AppSettings
 
     public bool StartWithWindows { get; set; }
 
+    /// <summary>When true, the app takes over the physical power button: pressing it switches to
+    /// "external screen only" instead of Windows' native "turn off all displays".</summary>
+    public bool PowerButtonTakeoverEnabled { get; set; }
+
+    /// <summary>The power button's original AC (plugged in) action, saved before we overwrote it
+    /// with "do nothing", so it can be restored when the takeover is turned back off.</summary>
+    public uint? SavedPowerButtonActionAc { get; set; }
+
+    /// <summary>Same as <see cref="SavedPowerButtonActionAc"/> but for DC (on battery).</summary>
+    public uint? SavedPowerButtonActionDc { get; set; }
+
     private static string SettingsPath
     {
         get
