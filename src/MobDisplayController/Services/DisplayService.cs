@@ -6,8 +6,13 @@ namespace MobDisplayController.Services;
 public sealed class DisplayService
 {
     /// <summary>
-    /// Enumerates every display path Windows knows about, including ones that
-    /// are currently disconnected/disabled (mirrors what Settings > Display shows).
+    /// Enumerates each physical monitor Windows can drive, including ones that are currently
+    /// disconnected/disabled (mirrors what Settings > Display shows).
+    ///
+    /// QDC_ALL_PATHS isn't a list of monitors: it pairs every target with every source it
+    /// could be driven from (5 or 10 entries per monitor), and includes every empty connector
+    /// slot and virtual display adapter on the system - 250 entries for 2 real screens on the
+    /// Legion Go. Those are filtered to targets with a monitor actually attached, one entry each.
     /// </summary>
     public List<MonitorEntry> GetAllMonitors()
     {
@@ -16,12 +21,23 @@ public sealed class DisplayService
         if (!TryQueryAllPaths(out var paths, out _))
             return result;
 
+        var byTarget = new Dictionary<(uint, int, uint), MonitorEntry>();
+
         foreach (var path in paths)
         {
-            bool isActive = (path.flags & Ccd.DISPLAYCONFIG_PATH_ACTIVE) != 0;
+            // Empty connector slots and idle virtual adapters report no attached monitor.
+            if (!path.targetInfo.targetAvailable)
+                continue;
 
-            string friendlyName = GetTargetFriendlyName(path.targetInfo.adapterId, path.targetInfo.id)
-                                   ?? "未知显示器";
+            bool isActive = (path.flags & Ccd.DISPLAYCONFIG_PATH_ACTIVE) != 0;
+            var id = (path.targetInfo.adapterId.LowPart, path.targetInfo.adapterId.HighPart, path.targetInfo.id);
+
+            // Keep one entry per physical target, preferring the active path - it's the one
+            // carrying the real source and GDI device name.
+            if (byTarget.TryGetValue(id, out var existing) && (existing.IsActive || !isActive))
+                continue;
+
+            var info = GetTargetInfo(path.targetInfo.adapterId, path.targetInfo.id);
 
             string? gdiName = null;
             if (isActive)
@@ -31,19 +47,22 @@ public sealed class DisplayService
                 is DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY.DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INTERNAL
                 or DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY.DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_EMBEDDED;
 
-            result.Add(new MonitorEntry
+            byTarget[id] = new MonitorEntry
             {
                 AdapterLuidLow = path.targetInfo.adapterId.LowPart,
                 AdapterLuidHigh = path.targetInfo.adapterId.HighPart,
                 SourceId = path.sourceInfo.id,
                 TargetId = path.targetInfo.id,
-                FriendlyName = friendlyName,
+                FriendlyName = info?.FriendlyName ?? "未知显示器",
+                EdidManufacturerId = info?.EdidManufacturerId ?? 0,
+                EdidProductCodeId = info?.EdidProductCodeId ?? 0,
                 IsActive = isActive,
                 IsInternal = isInternal,
                 GdiDeviceName = gdiName,
-            });
+            };
         }
 
+        result.AddRange(byTarget.Values);
         return result;
     }
 
@@ -334,7 +353,9 @@ public sealed class DisplayService
         return false;
     }
 
-    private static string? GetTargetFriendlyName(LUID adapterId, uint targetId)
+    private readonly record struct TargetInfo(string FriendlyName, ushort EdidManufacturerId, ushort EdidProductCodeId);
+
+    private static TargetInfo? GetTargetInfo(LUID adapterId, uint targetId)
     {
         var request = new DISPLAYCONFIG_TARGET_DEVICE_NAME
         {
@@ -351,17 +372,18 @@ public sealed class DisplayService
         if (rc != Ccd.ERROR_SUCCESS)
             return null;
 
-        if (!string.IsNullOrWhiteSpace(request.monitorFriendlyDeviceName))
-            return request.monitorFriendlyDeviceName;
+        string name = !string.IsNullOrWhiteSpace(request.monitorFriendlyDeviceName)
+            ? request.monitorFriendlyDeviceName
+            : request.outputTechnology switch
+            {
+                DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY.DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_EXTERNAL => "DisplayPort 显示器",
+                DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY.DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_EMBEDDED => "DisplayPort 显示器",
+                DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY.DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HDMI => "HDMI 显示器",
+                DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY.DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INTERNAL => "内置显示器",
+                _ => "未知显示器",
+            };
 
-        return request.outputTechnology switch
-        {
-            DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY.DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_EXTERNAL => "DisplayPort 显示器",
-            DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY.DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_EMBEDDED => "DisplayPort 显示器",
-            DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY.DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HDMI => "HDMI 显示器",
-            DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY.DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INTERNAL => "内置显示器",
-            _ => "未知显示器",
-        };
+        return new TargetInfo(name, request.edidManufactureId, request.edidProductCodeId);
     }
 
     private static string? GetSourceGdiDeviceName(LUID adapterId, uint sourceId)
