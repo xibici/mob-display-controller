@@ -61,6 +61,8 @@ public sealed class TrayAppContext : ApplicationContext
         // Ctrl+Alt+Shift+D forces both screens back on, for when you can't see to fix it.
         _recoveryHotkey = new HotkeyWindow(Hotkeys.MOD_CONTROL | Hotkeys.MOD_ALT | Hotkeys.MOD_SHIFT, (uint)Keys.D);
         _recoveryHotkey.Pressed += ForceRecoverDisplays;
+        if (!_recoveryHotkey.IsRegistered)
+            DebugLog.Write("recovery hotkey Ctrl+Alt+Shift+D is already taken - no blind recovery available");
 
         // Reconcile the on-disk preference with the actual power scheme setting, the same way
         // autostart is reconciled above - re-applying "do nothing" is idempotent and guards
@@ -218,9 +220,9 @@ public sealed class TrayAppContext : ApplicationContext
     {
         if (enable)
         {
-            // Only remember the pre-takeover action the first time - if the setting
-            // is already ours from a previous session, re-saving it would overwrite
-            // the user's real original action with "do nothing".
+            // Only remember the pre-takeover action the first time - once the setting is
+            // already ours from a previous session, re-reading it would just save our own
+            // "turn off display" over the user's real original action.
             if (_settings.SavedPowerButtonActionAc is null || _settings.SavedPowerButtonActionDc is null)
             {
                 var current = _powerButtonService.ReadCurrentAction();
@@ -240,6 +242,11 @@ public sealed class TrayAppContext : ApplicationContext
         }
         else
         {
+            // Turning the takeover off while the built-in panel is down would leave it down
+            // with no way to bring it back by button, so put the displays back first.
+            if (_internalOffMode)
+                ForceRecoverDisplays();
+
             _powerButtonService.Disable(_settings.SavedPowerButtonActionAc, _settings.SavedPowerButtonActionDc);
             _settings.SavedPowerButtonActionAc = null;
             _settings.SavedPowerButtonActionDc = null;
@@ -265,9 +272,17 @@ public sealed class TrayAppContext : ApplicationContext
         }
         else
         {
-            _topologyBeforeScreenOff = _displayService.GetTopologyMode();
+            var before = _displayService.GetTopologyMode();
+
+            // Never record ExternalOnly as the state to come back to - the built-in panel is
+            // already off in that mode, so restoring it would leave it off forever and the
+            // button would look dead no matter how many times it's pressed.
+            _topologyBeforeScreenOff = before is DisplayService.TopologyMode.ExternalOnly or DisplayService.TopologyMode.Unknown
+                ? DisplayService.TopologyMode.Extend
+                : before;
+
             bool ok = _displayService.TrySetTopology(DisplayService.TopologyMode.ExternalOnly, out var offError);
-            DebugLog.Write($"internal off (was {_topologyBeforeScreenOff}) -> ExternalOnly: ok={ok} {offError}");
+            DebugLog.Write($"internal off (was {before}, will restore to {_topologyBeforeScreenOff}) -> ExternalOnly: ok={ok} {offError}");
 
             if (!ok)
             {

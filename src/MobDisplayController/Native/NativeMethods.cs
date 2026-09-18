@@ -452,8 +452,15 @@ internal static class Power
     public const int MONITOR_ON = -1;
     public static readonly IntPtr HWND_BROADCAST = new(0xFFFF);
 
+    public const uint SMTO_ABORTIFHUNG = 0x0002;
+
+    /// <summary>
+    /// Always use the timeout form for HWND_BROADCAST: plain SendMessage waits for every
+    /// top-level window in the session, so one hung window blocks the caller indefinitely -
+    /// and this gets called from the UI thread, which would take the tray app down with it.
+    /// </summary>
     [DllImport("user32.dll")]
-    public static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+    public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam, uint fuFlags, uint uTimeout, out IntPtr lpdwResult);
 
     [StructLayout(LayoutKind.Sequential)]
     public struct LASTINPUTINFO

@@ -34,6 +34,15 @@ public sealed class PowerButtonService : IDisposable
     private DateTime _lastAcceptedPress = DateTime.MinValue;
     private static readonly TimeSpan PressDebounce = TimeSpan.FromSeconds(2);
 
+    /// <summary>
+    /// When the display last reported itself on. Blanking and unblanking can get into a
+    /// tug-of-war that alternates off/on every couple of hundred milliseconds, and those
+    /// spurious "off"s would otherwise read as presses and toggle the screens repeatedly.
+    /// A real press is always preceded by the display having been steadily on.
+    /// </summary>
+    private DateTime _lastReportedOn = DateTime.MinValue;
+    private static readonly TimeSpan MinStableOnTime = TimeSpan.FromMilliseconds(1500);
+
     public bool IsListening => _window is not null;
 
     /// <summary>Reads the active power scheme's current AC/DC power button action, or null on failure.</summary>
@@ -60,6 +69,17 @@ public sealed class PowerButtonService : IDisposable
             return false;
 
         StartListening();
+
+        if (_notificationHandle == IntPtr.Zero)
+        {
+            // Without the notification the button would silently do nothing but blank the
+            // screen, so don't leave the setting changed and claim success.
+            error = "无法注册显示器状态通知,已恢复电源键原有行为。";
+            DebugLog.Write("RegisterPowerSettingNotification failed");
+            StopListening();
+            return false;
+        }
+
         return true;
     }
 
@@ -103,9 +123,11 @@ public sealed class PowerButtonService : IDisposable
     /// <summary>Brings the displays back out of DPMS standby. Any monitor whose CCD path we deactivated stays dark.</summary>
     public void ForceDisplaysOn()
     {
-        // Our own blank/unblank shouldn't look like another button press.
-        _suppressUntil = DateTime.UtcNow.AddSeconds(3);
-        Power.SendMessage(Power.HWND_BROADCAST, Power.WM_SYSCOMMAND, Power.SC_MONITORPOWER, Power.MONITOR_ON);
+        // Our own blank/unblank shouldn't look like another button press. Kept below the
+        // press debounce so it never swallows a genuine second press.
+        _suppressUntil = DateTime.UtcNow.AddMilliseconds(1200);
+        Power.SendMessageTimeout(Power.HWND_BROADCAST, Power.WM_SYSCOMMAND, Power.SC_MONITORPOWER, Power.MONITOR_ON,
+            Power.SMTO_ABORTIFHUNG, 1000, out _);
     }
 
     private void OnPowerSettingChanged(Guid powerSetting, int value)
@@ -116,7 +138,17 @@ public sealed class PowerButtonService : IDisposable
         DebugLog.Write($"display state notification: value={value} (0=off 1=on 2=dimmed), idle={GetIdleTime().TotalSeconds:F1}s");
 
         if (value != Power.DISPLAY_STATE_OFF)
+        {
+            _lastReportedOn = DateTime.UtcNow;
             return;
+        }
+
+        var onFor = DateTime.UtcNow - _lastReportedOn;
+        if (onFor < MinStableOnTime)
+        {
+            DebugLog.Write($"  -> ignored: display had only been on for {onFor.TotalMilliseconds:F0}ms, looks like flapping");
+            return;
+        }
 
         if (DateTime.UtcNow < _suppressUntil)
         {

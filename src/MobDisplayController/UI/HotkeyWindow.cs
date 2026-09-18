@@ -15,10 +15,13 @@ public sealed class HotkeyWindow : NativeWindow, IDisposable
 
     public event Action? Pressed;
 
+    /// <summary>False when the combination was already taken by something else, in which case this hotkey does nothing.</summary>
+    public bool IsRegistered { get; }
+
     public HotkeyWindow(uint modifiers, uint virtualKey)
     {
         CreateHandle(new CreateParams { Parent = (IntPtr)HWND_MESSAGE });
-        Hotkeys.RegisterHotKey(Handle, HotkeyId, modifiers, virtualKey);
+        IsRegistered = Hotkeys.RegisterHotKey(Handle, HotkeyId, modifiers, virtualKey);
     }
 
     protected override void WndProc(ref Message m)
