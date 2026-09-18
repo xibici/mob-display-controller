@@ -430,8 +430,40 @@ internal static class Power
     /// <summary>SUB_BUTTONS: the "power and sleep buttons and lid" power settings subgroup.</summary>
     public static readonly Guid GUID_BUTTONS_SUBGROUP = new("4f971e89-eebd-4455-a8de-9e59040e7347");
 
-    /// <summary>PBUTTONACTION: what pressing the physical power button does. 0 = do nothing, 1 = sleep, 2 = hibernate, 3 = shut down.</summary>
+    /// <summary>PBUTTONACTION: what pressing the physical power button does.</summary>
     public static readonly Guid GUID_POWERBUTTON_ACTION = new("7648efa3-dd9c-4e3e-b566-50f929386280");
+
+    /// <summary>GUID_CONSOLE_DISPLAY_STATE: fires with 0 = off, 1 = on, 2 = dimmed whenever the console display's power state actually changes.</summary>
+    public static readonly Guid GUID_CONSOLE_DISPLAY_STATE = new("6fe69556-704a-47a0-8f24-c28d936fda47");
+
+    // PBUTTONACTION value indices, as enumerated by "powercfg /q SCHEME_CURRENT SUB_BUTTONS PBUTTONACTION".
+    public const uint PBUTTON_DO_NOTHING = 0;
+    public const uint PBUTTON_SLEEP = 1;
+    public const uint PBUTTON_HIBERNATE = 2;
+    public const uint PBUTTON_SHUTDOWN = 3;
+    public const uint PBUTTON_TURN_OFF_DISPLAY = 4;
+
+    public const int DISPLAY_STATE_OFF = 0;
+    public const int DISPLAY_STATE_ON = 1;
+    public const int DISPLAY_STATE_DIMMED = 2;
+
+    public const uint WM_SYSCOMMAND = 0x0112;
+    public const int SC_MONITORPOWER = 0xF170;
+    public const int MONITOR_ON = -1;
+    public static readonly IntPtr HWND_BROADCAST = new(0xFFFF);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct LASTINPUTINFO
+    {
+        public uint cbSize;
+        public uint dwTime;
+    }
+
+    [DllImport("user32.dll")]
+    public static extern bool GetLastInputInfo(ref LASTINPUTINFO plii);
 
     [DllImport("user32.dll", SetLastError = true)]
     public static extern IntPtr RegisterPowerSettingNotification(IntPtr hRecipient, ref Guid PowerSettingGuid, int Flags);
@@ -459,6 +491,21 @@ internal static class Power
 
     [DllImport("kernel32.dll")]
     public static extern IntPtr LocalFree(IntPtr hMem);
+}
+
+internal static class Hotkeys
+{
+    public const int WM_HOTKEY = 0x0312;
+
+    public const uint MOD_ALT = 0x0001;
+    public const uint MOD_CONTROL = 0x0002;
+    public const uint MOD_SHIFT = 0x0004;
+
+    [DllImport("user32.dll")]
+    public static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
+
+    [DllImport("user32.dll")]
+    public static extern bool UnregisterHotKey(IntPtr hWnd, int id);
 }
 
 #endregion

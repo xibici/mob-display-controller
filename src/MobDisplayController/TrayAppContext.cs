@@ -21,6 +21,8 @@ public sealed class TrayAppContext : ApplicationContext
     private readonly AppSettings _settings = AppSettings.Load();
 
     private DisplayService.TopologyMode? _topologyBeforeScreenOff;
+    private bool _internalOffMode;
+    private HotkeyWindow? _recoveryHotkey;
 
     private ToolStripMenuItem _statusItem = new();
     private ToolStripMenuItem _connectToggleItem = new();
@@ -54,9 +56,17 @@ public sealed class TrayAppContext : ApplicationContext
         // Reconcile the on-disk autostart preference with what's actually in the registry.
         _startupService.SetEnabled(_settings.StartWithWindows);
 
-        _powerButtonService.PowerButtonPressed += OnPowerButtonPressed;
+        _powerButtonService.DisplayTurnedOff += OnDisplayTurnedOff;
+
+        // Ctrl+Alt+Shift+D forces both screens back on, for when you can't see to fix it.
+        _recoveryHotkey = new HotkeyWindow(Hotkeys.MOD_CONTROL | Hotkeys.MOD_ALT | Hotkeys.MOD_SHIFT, (uint)Keys.D);
+        _recoveryHotkey.Pressed += ForceRecoverDisplays;
+
+        // Reconcile the on-disk preference with the actual power scheme setting, the same way
+        // autostart is reconciled above - re-applying "do nothing" is idempotent and guards
+        // against the setting having drifted back (e.g. a Windows update reset power schemes).
         if (_settings.PowerButtonTakeoverEnabled)
-            _powerButtonService.StartListening();
+            ApplyPowerButtonTakeover(true);
     }
 
     private void BuildStaticMenuItems()
@@ -240,25 +250,50 @@ public sealed class TrayAppContext : ApplicationContext
     }
 
     /// <summary>
-    /// Fires when the physical power button is pressed while its action is "do nothing".
-    /// Toggles between "external screen only" (internal off, external stays on) and
-    /// whatever topology was active before, instead of Windows' native "turn off all displays".
+    /// Runs right after the power button blanked the displays. The first press swaps to
+    /// "external only" and lights the external panel back up; the next press puts the
+    /// original topology back, which is what brings the built-in panel on again.
     /// </summary>
-    private void OnPowerButtonPressed()
+    private void OnDisplayTurnedOff()
     {
-        var current = _displayService.GetTopologyMode();
-
-        if (current == DisplayService.TopologyMode.ExternalOnly)
+        if (_internalOffMode)
         {
             var restoreMode = _topologyBeforeScreenOff ?? DisplayService.TopologyMode.Extend;
-            _displayService.TrySetTopology(restoreMode, out _);
+            bool ok = _displayService.TrySetTopology(restoreMode, out var restoreError);
+            DebugLog.Write($"restore -> {restoreMode}: ok={ok} {restoreError}");
+            _internalOffMode = false;
         }
         else
         {
-            _topologyBeforeScreenOff = current;
-            _displayService.TrySetTopology(DisplayService.TopologyMode.ExternalOnly, out _);
+            _topologyBeforeScreenOff = _displayService.GetTopologyMode();
+            bool ok = _displayService.TrySetTopology(DisplayService.TopologyMode.ExternalOnly, out var offError);
+            DebugLog.Write($"internal off (was {_topologyBeforeScreenOff}) -> ExternalOnly: ok={ok} {offError}");
+
+            if (!ok)
+            {
+                // Couldn't drop the internal panel - don't leave everything blanked.
+                _powerButtonService.ForceDisplaysOn();
+                return;
+            }
+            _internalOffMode = true;
         }
 
+        // The button left every panel in DPMS standby; wake whatever is still attached.
+        // A monitor we just deactivated at the CCD level stays dark regardless.
+        _powerButtonService.ForceDisplaysOn();
+        RefreshMenuSafe();
+    }
+
+    /// <summary>
+    /// Escape hatch for when the screens are in a state you can't see to fix: forces both
+    /// displays back to extend and powers them on. Usable blind, by feel.
+    /// </summary>
+    private void ForceRecoverDisplays()
+    {
+        _internalOffMode = false;
+        _topologyBeforeScreenOff = null;
+        _displayService.TrySetTopology(DisplayService.TopologyMode.Extend, out _);
+        _powerButtonService.ForceDisplaysOn();
         RefreshMenuSafe();
     }
 
@@ -585,9 +620,11 @@ public sealed class TrayAppContext : ApplicationContext
 
     private void ExitApplication()
     {
-        // Only stop listening - leave the power scheme's "do nothing" setting in place,
-        // since the point of the takeover is that it keeps working across app restarts.
+        // Only stop listening - leave the power scheme's "turn off display" action in place,
+        // since the point of the takeover is that it keeps working across app restarts, and
+        // that action is a perfectly usable button behaviour on its own.
         _powerButtonService.Dispose();
+        _recoveryHotkey?.Dispose();
 
         _trayIcon.Visible = false;
         _trayIcon.Dispose();
