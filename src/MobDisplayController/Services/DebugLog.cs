@@ -28,9 +28,15 @@ public static class DebugLog
             {
                 var path = LogPath;
 
-                // Keep it from growing without bound across sessions.
-                if (File.Exists(path) && new FileInfo(path).Length > 256 * 1024)
-                    File.Delete(path);
+                // Keep it bounded without throwing the recent history away. This machine's DDC/CI
+                // probing is chatty enough that deleting the whole file would regularly wipe the
+                // press history - which is the only reason this log exists.
+                if (File.Exists(path) && new FileInfo(path).Length > 512 * 1024)
+                {
+                    var lines = File.ReadAllLines(path);
+                    var keep = lines.Length > 800 ? lines[^800..] : lines;
+                    File.WriteAllLines(path, keep);
+                }
 
                 File.AppendAllText(path, $"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}  {message}{Environment.NewLine}");
             }

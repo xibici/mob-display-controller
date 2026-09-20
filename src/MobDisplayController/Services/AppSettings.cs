@@ -64,7 +64,14 @@ public sealed class AppSettings
     public void Save()
     {
         var json = JsonSerializer.Serialize(this, AppSettingsJsonContext.Default.AppSettings);
-        File.WriteAllText(SettingsPath, json);
+
+        // Write-then-replace rather than write-in-place: a crash or power loss mid-write would leave a
+        // truncated file, and Load() would then quietly fall back to defaults - losing exactly the
+        // "original action" values that are supposed to survive.
+        var path = SettingsPath;
+        var temp = path + ".tmp";
+        File.WriteAllText(temp, json);
+        File.Move(temp, path, overwrite: true);
     }
 }
 

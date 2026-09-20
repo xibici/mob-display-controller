@@ -1,3 +1,5 @@
+using MobDisplayController.Services;
+
 namespace MobDisplayController;
 
 internal static class Program
@@ -11,11 +13,10 @@ internal static class Program
 
         if (!createdNew)
         {
-            MessageBox.Show(
-                "移动显示器控制器已经在系统托盘中运行。",
-                "MobDisplayController",
-                MessageBoxButtons.OK,
-                MessageBoxIcon.Information);
+            // Deliberately no modal dialog: a MessageBox here would sit waiting for a click and show
+            // up as a second, apparently running, process. The tray icon is already there to say the
+            // app is running, so just step aside.
+            DebugLog.Write("another instance owns the tray - exiting");
             return;
         }
 

@@ -66,7 +66,8 @@ static PBTN_BLOB        g_Blob;
 static KSPIN_LOCK       g_Lock;
 static HANDLE           g_Key;
 static HANDLE           g_ServiceKey;
-static HANDLE           g_Event;            /* named event signalled when the button is reported */
+static HANDLE           g_Event;            /* named event handle */
+static PKEVENT          g_EventObject;      /* the same event as an object: KeSetEvent works at any IRQL */
 static WCHAR            g_ServicePathBuffer[256];
 static UNICODE_STRING   g_ServicePath;
 static LARGE_INTEGER    g_LastWrite;
@@ -115,6 +116,8 @@ static VOID BtnFlush(VOID)
 }
 
 static VOID BtnCreateKey(VOID);
+static VOID BtnCreateObjects(VOID);
+static VOID BtnFlush(VOID);
 
 static VOID BtnRecord(UCHAR Major, UCHAR Minor, ULONG Ioctl)
 {
@@ -153,10 +156,12 @@ static VOID BtnRecord(UCHAR Major, UCHAR Minor, ULONG Ioctl)
     if (KeGetCurrentIrql() == PASSIVE_LEVEL) {
         LARGE_INTEGER stamp;
         KeQuerySystemTime(&stamp);
+        if (g_Key == NULL)
+            BtnCreateKey();     /* retry: the first attempt can be too early in boot */
+        if (g_EventObject == NULL)
+            BtnCreateObjects(); /* same reason: the first ioctl may arrive before a session exists */
         if ((stamp.QuadPart - g_LastWrite.QuadPart) / 10000 > BTN_MIN_WRITE) {
             g_LastWrite = stamp;
-            if (g_Key == NULL)
-                BtnCreateKey();     /* retry: the first attempt can be too early in boot */
             BtnFlush();
         }
     }
@@ -200,8 +205,11 @@ static IO_COMPLETION_ROUTINE BtnEventCompletion;
 
 static VOID BtnSignal(VOID)
 {
-    if (g_Event != NULL)
-        ZwSetEvent(g_Event, NULL);
+    /* KeSetEvent, not ZwSetEvent: this runs from an IRP completion routine, and the button event is
+       reported by the ACPI stack - which can complete the pending request at DISPATCH_LEVEL.
+       ZwSetEvent is only legal at PASSIVE_LEVEL, so using it would be a bugcheck waiting to happen. */
+    if (g_EventObject != NULL)
+        KeSetEvent(g_EventObject, IO_NO_INCREMENT, FALSE);
 }
 
 static NTSTATUS BtnEventCompletion(PDEVICE_OBJECT DeviceObject, PIRP Irp, PVOID Context)
@@ -240,18 +248,20 @@ static NTSTATUS BtnEventCompletion(PDEVICE_OBJECT DeviceObject, PIRP Irp, PVOID 
 static VOID BtnCreateObjects(VOID)
 {
     UNICODE_STRING name;
-    OBJECT_ATTRIBUTES attributes;
 
-    if (g_Event != NULL || KeGetCurrentIrql() != PASSIVE_LEVEL)
+    if (g_EventObject != NULL || KeGetCurrentIrql() != PASSIVE_LEVEL)
         return;
 
-    RtlInitUnicodeString(&name, L"\\BaseNamedObjects\\Global\\BtnDrvEvent");
-    InitializeObjectAttributes(&attributes, &name,
-                               OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
-    if (!NT_SUCCESS(ZwCreateEvent(&g_Event, EVENT_ALL_ACCESS, &attributes,
-                                  NotificationEvent, FALSE))) {
+    /* IoCreateNotificationEvent hands back both the handle and the object, and creates the name under
+       \BaseNamedObjects - so user mode opens exactly the same thing as "Global\BtnDrvEvent". */
+    RtlInitUnicodeString(&name, L"Global\\BtnDrvEvent");
+    g_EventObject = IoCreateNotificationEvent(&name, &g_Event);
+    if (g_EventObject == NULL) {
         g_Event = NULL;
+        return;
     }
+
+    DbgPrint("btndrv: event Global\\BtnDrvEvent created\n");
 }
 
 static NTSTATUS BtnPassThrough(PDEVICE_OBJECT DeviceObject, PIRP Irp)
@@ -267,6 +277,21 @@ static NTSTATUS BtnPassThrough(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     }
 
     BtnRecord(stack->MajorFunction, stack->MinorFunction, ioctl);
+
+    if (stack->MajorFunction == IRP_MJ_PNP && stack->MinorFunction == IRP_MN_REMOVE_DEVICE) {
+        /* Let the stack below tear down first, then detach and delete our filter object. Without this
+           the device can never be stopped and restarted - which is what "restart the device" needs. */
+        NTSTATUS status;
+        IoSkipCurrentIrpStackLocation(Irp);
+        status = IoCallDriver(g_Lower, Irp);
+        if (g_Self != NULL) {
+            IoDetachDevice(g_Lower);
+            IoDeleteDevice(g_Self);
+            g_Self = NULL;
+            g_Lower = NULL;
+        }
+        return status;
+    }
 
     if (ioctl == BTN_IOCTL_EVENT) {
         /* Take a copy of the stack location so the request can be followed to its completion -
@@ -348,6 +373,10 @@ static VOID BtnUnload(PDRIVER_OBJECT DriverObject)
         BtnFlush();
         ZwClose(g_ServiceKey);
         g_ServiceKey = NULL;
+    }
+
+    if (g_EventObject != NULL) {
+        g_EventObject = NULL;
     }
 
     if (g_Event != NULL) {

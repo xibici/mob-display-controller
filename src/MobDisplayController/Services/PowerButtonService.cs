@@ -73,6 +73,13 @@ public sealed class PowerButtonService : IDisposable
     private static readonly TimeSpan PressDebounce = TimeSpan.FromSeconds(2);
 
     /// <summary>
+    /// Same idea for presses the driver reports, but far shorter: the driver only signals a real
+    /// button event, so there is nothing ambiguous to defend against - and a long debounce would
+    /// silently swallow a deliberate second press.
+    /// </summary>
+    private static readonly TimeSpan DriverPressDebounce = TimeSpan.FromMilliseconds(250);
+
+    /// <summary>
     /// When the display last reported itself on. Blanking and unblanking can get into a
     /// tug-of-war that alternates off/on every couple of hundred milliseconds, and those
     /// spurious "off"s would otherwise read as presses and toggle the screens repeatedly.
@@ -128,10 +135,11 @@ public sealed class PowerButtonService : IDisposable
         if (!TryWriteAction(action, action, out error))
             return false;
 
-        if (_notificationHandle == IntPtr.Zero)
+        if (_notificationHandle == IntPtr.Zero && !_driverBacked)
         {
-            // Without the notification the service would be blind, so don't leave the setting
-            // changed and claim success.
+            // Without the notification the fallback path would be blind, so don't leave the setting
+            // changed and claim success. With the driver in place the notification is only used for a
+            // log line, so a failure there must not take the takeover down.
             error = "无法注册显示器状态通知,已恢复电源键原有行为。";
             DebugLog.Write("RegisterPowerSettingNotification failed - restoring the original power button action");
             StopListening();
@@ -439,7 +447,7 @@ public sealed class PowerButtonService : IDisposable
 
                 _driverEvent.Reset();
 
-                if (DateTime.UtcNow - _lastAcceptedPress < PressDebounce)
+                if (DateTime.UtcNow - _lastAcceptedPress < DriverPressDebounce)
                 {
                     DebugLog.Write("driver press debounced");
                     continue;
