@@ -55,10 +55,10 @@ src/MobDisplayController/
 - DDC/CI 依赖硬件支持,如果亮度/音量菜单显示为灰色,说明该便携屏或连接方式不支持这两项。
 - 目前面向单显示器场景优化(一台"DP"便携屏);如果你有多台同名显示器,请在设置里通过下拉框精确选择,程序会记住其唯一 ID 而不仅仅是名字。
 
-## 切换显示模式不会动分辨率
+## 程序不会设置分辨率
 
-**程序不会自动设置分辨率。** `显示模式` 菜单(以及电源键、`Ctrl+Alt+Shift+L`)只切换拓扑,分辨率交给 Windows 自己决定;唯一会设置分辨率的地方是 `分辨率` 子菜单,那是你手动点的。
+**程序里已经没有任何分辨率功能:** 没有分辨率菜单、也没有自动设置。`显示模式` 菜单(以及电源键、`Ctrl+Alt+Shift+L`)只切换拓扑,分辨率完全交给 Windows ✓。唯一一处"自动"的动作是复制模式切换后把外屏**旋转**归零 —— 旋转不是分辨率 ✓。
 
 之前不是这样:切换前会先记下当前分辨率,切完再"放回去",以免复制模式把桌面掉到两块屏共享的分辨率上。但这个"放回去"走的是 `ChangeDisplaySettingsEx` + `CDS_UPDATEREGISTRY` —— **它会把分辨率写进注册表**,而复制模式下记下的那个分辨率是"旋转后的共享源"(宽度 1200),于是每次开机 Windows 都恢复成这个不存在的尺寸 ✗。
 
-现在已经把这个自动设置删掉 ✓。如果你机器上也留下过这种坏配置,可以在 `HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers\Configuration` 下删除 `PrimSurfSize.cx` 为 1200 的那几个键(Windows 会自己重建),删之前先导出备份。日志里 `switch: mode untouched at ...` / `switch: Windows moved the mode ...` 会告诉你切换时 Windows 有没有动分辨率 —— 只读,不改 ✗。
+自动设置和手动分辨率菜单现在都已删除 ✓。历史遗留的坏配置在 `HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers\Configuration` 下,把 `PrimSurfSize.cx` 为 1200 的那几个键删掉即可(Windows 会自己重建),删之前先导出备份。日志里 `switch: mode untouched at ...` / `switch: Windows moved the mode ...` 会告诉你切换时 Windows 有没有动分辨率 —— 只读,不改 ✗。

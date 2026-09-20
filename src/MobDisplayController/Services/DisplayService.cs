@@ -183,67 +183,12 @@ public sealed class DisplayService
         return false;
     }
 
-    /// <summary>Returns the list of supported resolutions/refresh rates for an active monitor's GDI device.</summary>
-    public List<(int Width, int Height, int Hz)> GetSupportedModes(string gdiDeviceName)
-    {
-        var modes = new List<(int, int, int)>();
-        var seen = new HashSet<(int, int, int)>();
-        var devMode = new DEVMODE { dmSize = (short)System.Runtime.InteropServices.Marshal.SizeOf<DEVMODE>() };
-
-        int i = 0;
-        while (Gdi.EnumDisplaySettingsEx(gdiDeviceName, i, ref devMode, 0))
-        {
-            var tuple = (devMode.dmPelsWidth, devMode.dmPelsHeight, devMode.dmDisplayFrequency);
-            if (devMode.dmPelsWidth > 0 && devMode.dmPelsHeight > 0 && seen.Add(tuple))
-                modes.Add(tuple);
-            i++;
-            devMode = new DEVMODE { dmSize = (short)System.Runtime.InteropServices.Marshal.SizeOf<DEVMODE>() };
-        }
-
-        modes.Sort((a, b) =>
-        {
-            int c = (b.Item1 * b.Item2).CompareTo(a.Item1 * a.Item2);
-            return c != 0 ? c : b.Item3.CompareTo(a.Item3);
-        });
-
-        return modes;
-    }
-
     public (int Width, int Height, int Hz)? GetCurrentMode(string gdiDeviceName)
     {
         var devMode = new DEVMODE { dmSize = (short)System.Runtime.InteropServices.Marshal.SizeOf<DEVMODE>() };
         if (!Gdi.EnumDisplaySettingsEx(gdiDeviceName, Gdi.ENUM_CURRENT_SETTINGS, ref devMode, 0))
             return null;
         return (devMode.dmPelsWidth, devMode.dmPelsHeight, devMode.dmDisplayFrequency);
-    }
-
-    public bool TrySetResolution(string gdiDeviceName, int width, int height, int hz, out string error)
-    {
-        error = string.Empty;
-        var devMode = new DEVMODE { dmSize = (short)System.Runtime.InteropServices.Marshal.SizeOf<DEVMODE>() };
-
-        if (!Gdi.EnumDisplaySettingsEx(gdiDeviceName, Gdi.ENUM_CURRENT_SETTINGS, ref devMode, 0))
-        {
-            error = "无法读取当前显示模式。";
-            return false;
-        }
-
-        devMode.dmPelsWidth = width;
-        devMode.dmPelsHeight = height;
-        devMode.dmDisplayFrequency = hz;
-        devMode.dmFields = Gdi.DM_PELSWIDTH | Gdi.DM_PELSHEIGHT | Gdi.DM_DISPLAYFREQUENCY;
-
-        int rc = Gdi.ChangeDisplaySettingsEx(gdiDeviceName, ref devMode, IntPtr.Zero, Gdi.CDS_UPDATEREGISTRY, IntPtr.Zero);
-        if (rc == Gdi.DISP_CHANGE_SUCCESSFUL)
-            return true;
-
-        error = rc switch
-        {
-            Gdi.DISP_CHANGE_BADMODE => "该显示器不支持此分辨率/刷新率组合。",
-            Gdi.DISP_CHANGE_RESTART => "需要重启才能生效。",
-            _ => $"设置分辨率失败,错误码 {rc}。",
-        };
-        return rc == Gdi.DISP_CHANGE_RESTART; // restart-required still counts as "applied"
     }
 
     /// <summary>Returns this monitor's own rotation as recorded on its CCD display path.</summary>

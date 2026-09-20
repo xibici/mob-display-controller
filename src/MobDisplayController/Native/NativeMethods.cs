@@ -216,7 +216,7 @@ internal static class Ccd
 
 #endregion
 
-#region Classic GDI display API (EnumDisplayDevices / ChangeDisplaySettingsEx)
+#region Classic GDI display API (read only: EnumDisplayDevices / EnumDisplaySettingsEx)
 
 [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
 internal struct DISPLAY_DEVICE
@@ -296,27 +296,6 @@ internal static class Gdi
     public const int ENUM_CURRENT_SETTINGS = -1;
     public const uint EDD_GET_DEVICE_INTERFACE_NAME = 0x00000001;
 
-    public const int DM_PELSWIDTH = 0x80000;
-    public const int DM_PELSHEIGHT = 0x100000;
-    public const int DM_DISPLAYFREQUENCY = 0x400000;
-    public const int DM_BITSPERPEL = 0x40000;
-
-    public const int CDS_UPDATEREGISTRY = 0x00000001;
-    public const int CDS_TEST = 0x00000002;
-    public const int CDS_FULLSCREEN = 0x00000004;
-    public const int CDS_GLOBAL = 0x00000008;
-    public const int CDS_SET_PRIMARY = 0x00000010;
-    public const int CDS_NORESET = 0x10000000;
-
-    public const int DISP_CHANGE_SUCCESSFUL = 0;
-    public const int DISP_CHANGE_RESTART = 1;
-    public const int DISP_CHANGE_FAILED = -1;
-    public const int DISP_CHANGE_BADMODE = -2;
-    public const int DISP_CHANGE_NOTUPDATED = -3;
-    public const int DISP_CHANGE_BADFLAGS = -4;
-    public const int DISP_CHANGE_BADPARAM = -5;
-    public const int DISP_CHANGE_BADDUALVIEW = -6;
-
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     public static extern bool EnumDisplayDevices(
         string? lpDevice,
@@ -330,22 +309,6 @@ internal static class Gdi
         int iModeNum,
         ref DEVMODE lpDevMode,
         uint dwFlags);
-
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-    public static extern int ChangeDisplaySettingsEx(
-        string lpszDeviceName,
-        ref DEVMODE lpDevMode,
-        IntPtr hwnd,
-        uint dwflags,
-        IntPtr lParam);
-
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-    public static extern int ChangeDisplaySettingsEx(
-        string lpszDeviceName,
-        IntPtr lpDevMode,
-        IntPtr hwnd,
-        uint dwflags,
-        IntPtr lParam);
 }
 
 #endregion

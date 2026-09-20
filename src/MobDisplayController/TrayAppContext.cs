@@ -32,7 +32,6 @@ public sealed class TrayAppContext : ApplicationContext
     private ToolStripMenuItem _statusItem = new();
     private ToolStripMenuItem _connectToggleItem = new();
     private ToolStripMenuItem _displayModeMenuItem = new();
-    private ToolStripMenuItem _resolutionMenuItem = new();
     private ToolStripMenuItem _rotationMenuItem = new();
     private ToolStripMenuItem _brightnessMenuItem = new();
     private ToolStripMenuItem _volumeMenuItem = new();
@@ -141,7 +140,6 @@ public sealed class TrayAppContext : ApplicationContext
         _menu.Items.Add(new ToolStripSeparator());
         _menu.Items.Add(_connectToggleItem);
         _menu.Items.Add(_displayModeMenuItem);
-        _menu.Items.Add(_resolutionMenuItem);
         _menu.Items.Add(_rotationMenuItem);
         _menu.Items.Add(_brightnessMenuItem);
         _menu.Items.Add(_volumeMenuItem);
@@ -181,8 +179,6 @@ public sealed class TrayAppContext : ApplicationContext
             _connectToggleItem.Enabled = false;
             _displayModeMenuItem.Enabled = false;
             _displayModeMenuItem.DropDownItems.Clear();
-            _resolutionMenuItem.Enabled = false;
-            _resolutionMenuItem.DropDownItems.Clear();
             _rotationMenuItem.Enabled = false;
             _rotationMenuItem.DropDownItems.Clear();
             _brightnessMenuItem.Enabled = false;
@@ -200,7 +196,6 @@ public sealed class TrayAppContext : ApplicationContext
         _connectToggleItem.Text = target.IsActive ? "断开连接" : "重新连接";
 
         BuildDisplayModeSubmenu(target);
-        BuildResolutionSubmenu(target);
         BuildRotationSubmenu(target);
         BuildBrightnessSubmenu(target);
         BuildVolumeSubmenu(target);
@@ -270,8 +265,8 @@ public sealed class TrayAppContext : ApplicationContext
     /// never move the resolution. That turned out to be worse than the problem it solved: putting a
     /// mode back goes through ChangeDisplaySettingsEx with CDS_UPDATEREGISTRY, which *writes the mode
     /// into the registry for that display* - so whatever the desktop happened to be at while a switch
-    /// ran became what Windows restores at every boot. Nothing sets a mode automatically any more;
-    /// the 分辨率 menu is the only place, and that one is deliberate.
+    /// ran became what Windows restores at every boot. There is no resolution feature in this app any
+    /// more - not automatic and not manual - so nothing here can write a mode.
     /// </summary>
     private bool TrySwitchLayout(DisplayService.TopologyMode mode, out string error)
     {
@@ -484,68 +479,6 @@ public sealed class TrayAppContext : ApplicationContext
         ToggleLayout("hotkey");
         RefreshMenuSafe();
     }
-
-    private void BuildResolutionSubmenu(MonitorEntry target)
-    {
-        _resolutionMenuItem.DropDownItems.Clear();
-        _resolutionMenuItem.Text = "分辨率";
-
-        if (!target.IsActive || target.GdiDeviceName is null)
-        {
-            _resolutionMenuItem.Enabled = false;
-            return;
-        }
-
-        var modes = _displayService.GetSupportedModes(target.GdiDeviceName);
-        var current = _displayService.GetCurrentMode(target.GdiDeviceName);
-
-        if (modes.Count == 0)
-        {
-            _resolutionMenuItem.Enabled = false;
-            return;
-        }
-
-        _resolutionMenuItem.Enabled = true;
-
-        // Only offer the two resolutions this monitor is actually used at; for each,
-        // pick the highest refresh rate it supports (e.g. 144Hz) rather than listing
-        // every width/height/Hz combination the driver reports.
-        foreach (var (width, height) in PreferredResolutions)
-        {
-            var candidates = modes
-                .Where(m => m.Width == width && m.Height == height)
-                .OrderByDescending(m => m.Hz)
-                .ToList();
-
-            (int Width, int Height, int Hz)? best = candidates.Count > 0 ? candidates[0] : null;
-
-            if (best is null)
-            {
-                _resolutionMenuItem.DropDownItems.Add(new ToolStripMenuItem($"{width} x {height} (不支持)") { Enabled = false });
-                continue;
-            }
-
-            var mode = best.Value;
-            bool isCurrent = current is not null && current.Value.Width == mode.Width && current.Value.Height == mode.Height;
-
-            var item = new ToolStripMenuItem($"{mode.Width} x {mode.Height} @ {mode.Hz}Hz")
-            {
-                Checked = isCurrent,
-            };
-            item.Click += (_, _) =>
-            {
-                if (!_displayService.TrySetResolution(target.GdiDeviceName!, mode.Width, mode.Height, mode.Hz, out var err) && err.Length > 0)
-                    ShowBalloon("设置分辨率失败", err, ToolTipIcon.Error);
-            };
-            _resolutionMenuItem.DropDownItems.Add(item);
-        }
-    }
-
-    private static readonly (int Width, int Height)[] PreferredResolutions =
-    {
-        (1920, 1080),
-        (1920, 1200),
-    };
 
     private void BuildRotationSubmenu(MonitorEntry target)
     {
