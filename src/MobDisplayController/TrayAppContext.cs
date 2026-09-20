@@ -32,7 +32,6 @@ public sealed class TrayAppContext : ApplicationContext
     private ToolStripMenuItem _statusItem = new();
     private ToolStripMenuItem _connectToggleItem = new();
     private ToolStripMenuItem _displayModeMenuItem = new();
-    private ToolStripMenuItem _rotationMenuItem = new();
     private ToolStripMenuItem _brightnessMenuItem = new();
     private ToolStripMenuItem _volumeMenuItem = new();
     private ToolStripMenuItem _startupMenuItem = new();
@@ -140,7 +139,6 @@ public sealed class TrayAppContext : ApplicationContext
         _menu.Items.Add(new ToolStripSeparator());
         _menu.Items.Add(_connectToggleItem);
         _menu.Items.Add(_displayModeMenuItem);
-        _menu.Items.Add(_rotationMenuItem);
         _menu.Items.Add(_brightnessMenuItem);
         _menu.Items.Add(_volumeMenuItem);
         _menu.Items.Add(new ToolStripSeparator());
@@ -179,8 +177,6 @@ public sealed class TrayAppContext : ApplicationContext
             _connectToggleItem.Enabled = false;
             _displayModeMenuItem.Enabled = false;
             _displayModeMenuItem.DropDownItems.Clear();
-            _rotationMenuItem.Enabled = false;
-            _rotationMenuItem.DropDownItems.Clear();
             _brightnessMenuItem.Enabled = false;
             _brightnessMenuItem.DropDownItems.Clear();
             _volumeMenuItem.Enabled = false;
@@ -196,7 +192,6 @@ public sealed class TrayAppContext : ApplicationContext
         _connectToggleItem.Text = target.IsActive ? "断开连接" : "重新连接";
 
         BuildDisplayModeSubmenu(target);
-        BuildRotationSubmenu(target);
         BuildBrightnessSubmenu(target);
         BuildVolumeSubmenu(target);
     }
@@ -207,12 +202,10 @@ public sealed class TrayAppContext : ApplicationContext
     ///
     /// The built-in panel is a portrait panel that Windows presents landscape with a 90 degree target
     /// rotation, and the external one is an ordinary landscape monitor, so a duplicate hands the same
-    /// source mode and rotation to both. That inherited rotation is left alone deliberately: it is
-    /// what makes the shared portrait picture come out upright on both panels, and changing one
-    /// target's rotation while they share a source is what previously threw the external monitor off
-    /// its signal. What made the duplicate look unstable before was more likely the mode being
-    /// re-applied after every switch (see TrySwitchLayout) - on a shared source that means touching
-    /// the timing of both panels at once.
+    /// source mode and rotation to both. That inherited rotation is now left exactly as Windows sets
+    /// it: this app has no rotation feature any more, neither in the menu nor after a switch. What made
+    /// the duplicate look unstable before was more likely the mode being re-applied after every switch
+    /// (see TrySwitchLayout) - on a shared source that means touching the timing of both panels at once.
     /// </summary>
     private const DisplayService.TopologyMode BothScreensMode = DisplayService.TopologyMode.Clone;
 
@@ -259,7 +252,8 @@ public sealed class TrayAppContext : ApplicationContext
     }
 
     /// <summary>
-    /// Switches layouts, and nothing else: the mode Windows picks for the new topology is left alone.
+    /// Switches layouts, and nothing else. Neither the mode nor the rotation is touched: whatever
+    /// Windows picks for the new topology is what you get, and this only reports the mode it chose.
     ///
     /// This used to capture the current mode first and put it back afterwards, so that a switch could
     /// never move the resolution. That turned out to be worse than the problem it solved: putting a
@@ -275,18 +269,6 @@ public sealed class TrayAppContext : ApplicationContext
 
         if (!_displayService.TrySetTopology(mode, out error))
             return false;
-
-        if (mode == DisplayService.TopologyMode.Clone)
-        {
-            // Building a duplicate copies the built-in panel's 90 degrees onto the external monitor
-            // too, which leaves the external picture lying on its side; only the built-in needs that
-            // rotation. Rotation is a property of the display path rather than the shared source mode,
-            // so this one is still set - and unlike a mode it does not decide anything for the boot.
-            if (_displayService.TryNormalizeExternalRotation(out var rotationError))
-                DebugLog.Write("duplicate: external rotation normalised to 0");
-            else
-                DebugLog.Write($"duplicate: external rotation left as Windows set it ({rotationError})");
-        }
 
         if (GetDesktopMode() is { } after)
         {
@@ -479,57 +461,6 @@ public sealed class TrayAppContext : ApplicationContext
         ToggleLayout("hotkey");
         RefreshMenuSafe();
     }
-
-    private void BuildRotationSubmenu(MonitorEntry target)
-    {
-        _rotationMenuItem.DropDownItems.Clear();
-        _rotationMenuItem.Text = "旋转";
-
-        if (!target.IsActive)
-        {
-            _rotationMenuItem.Enabled = false;
-            return;
-        }
-
-        // In Duplicate/clone mode this monitor shares its source mode with another display.
-        // Windows can't give two cloned targets different rotations, and asking it to try
-        // doesn't fail cleanly - it can silently drop this target's path entirely instead.
-        if (_displayService.GetTopologyMode() == DisplayService.TopologyMode.Clone)
-        {
-            _rotationMenuItem.Enabled = false;
-            _rotationMenuItem.DropDownItems.Add(new ToolStripMenuItem("复制模式下两块屏同画面,无法单独旋转;请先切到「仅外屏」") { Enabled = false });
-            return;
-        }
-
-        var current = _displayService.GetCurrentOrientation(target);
-        if (current is null)
-        {
-            _rotationMenuItem.Enabled = false;
-            return;
-        }
-
-        _rotationMenuItem.Enabled = true;
-
-        foreach (var (label, rotation) in RotationOptions)
-        {
-            var item = new ToolStripMenuItem(label) { Checked = current == rotation };
-            item.Click += (_, _) =>
-            {
-                if (!_displayService.TrySetOrientation(target, rotation, out var err) && err.Length > 0)
-                    ShowBalloon("设置旋转失败", err, ToolTipIcon.Error);
-                RefreshMenu();
-            };
-            _rotationMenuItem.DropDownItems.Add(item);
-        }
-    }
-
-    private static readonly (string Label, DISPLAYCONFIG_ROTATION Rotation)[] RotationOptions =
-    {
-        ("0°(默认方向)", DISPLAYCONFIG_ROTATION.DISPLAYCONFIG_ROTATION_IDENTITY),
-        ("90°", DISPLAYCONFIG_ROTATION.DISPLAYCONFIG_ROTATION_ROTATE90),
-        ("180°(翻转)", DISPLAYCONFIG_ROTATION.DISPLAYCONFIG_ROTATION_ROTATE180),
-        ("270°", DISPLAYCONFIG_ROTATION.DISPLAYCONFIG_ROTATION_ROTATE270),
-    };
 
     private void BuildBrightnessSubmenu(MonitorEntry target)
     {
