@@ -264,16 +264,19 @@ public sealed class TrayAppContext : ApplicationContext
     }
 
     /// <summary>
-    /// Switches layouts while leaving the desktop at the resolution it already has.
+    /// Switches layouts, and nothing else: the mode Windows picks for the new topology is left alone.
     ///
-    /// Asking Windows for a topology by name (SDC_TOPOLOGY_CLONE / _EXTERNAL) also lets it pick the
-    /// modes that make that layout valid, which is how mirroring used to drop the desktop to
-    /// 1280x800 - a mode both panels happen to share. So the current mode is captured first and put
-    /// back afterwards; only the panel coming or going changes.
+    /// This used to capture the current mode first and put it back afterwards, so that a switch could
+    /// never move the resolution. That turned out to be worse than the problem it solved: putting a
+    /// mode back goes through ChangeDisplaySettingsEx with CDS_UPDATEREGISTRY, which *writes the mode
+    /// into the registry for that display* - so whatever the desktop happened to be at while a switch
+    /// ran became what Windows restores at every boot. Nothing sets a mode automatically any more;
+    /// the 分辨率 menu is the only place, and that one is deliberate.
     /// </summary>
     private bool TrySwitchLayout(DisplayService.TopologyMode mode, out string error)
     {
-        var keepMode = GetDesktopMode();
+        // Read only. This is what says whether Windows moved the mode, without the app deciding it.
+        var before = GetDesktopMode();
 
         if (!_displayService.TrySetTopology(mode, out error))
             return false;
@@ -282,67 +285,36 @@ public sealed class TrayAppContext : ApplicationContext
         {
             // Building a duplicate copies the built-in panel's 90 degrees onto the external monitor
             // too, which leaves the external picture lying on its side; only the built-in needs that
-            // rotation. Done before the mode check below, because this is the step that has to happen
-            // on every duplicate switch, not just the ones that also move the mode.
+            // rotation. Rotation is a property of the display path rather than the shared source mode,
+            // so this one is still set - and unlike a mode it does not decide anything for the boot.
             if (_displayService.TryNormalizeExternalRotation(out var rotationError))
                 DebugLog.Write("duplicate: external rotation normalised to 0");
             else
                 DebugLog.Write($"duplicate: external rotation left as Windows set it ({rotationError})");
         }
 
-        if (keepMode is not { } wanted)
-            return true;
-
-        // Only put the mode back when the switch actually moved it. In a duplicate the two panels
-        // share one source mode and Windows normally keeps the mode that was already there, so most
-        // switches need nothing at all - and re-applying it anyway meant setting a mode on a source
-        // that two panels were sharing, which is what made the external monitor lose its signal and
-        // drop off. "If it is already right, don't touch it."
-        if (GetDesktopMode() is { } now && now == wanted)
+        if (GetDesktopMode() is { } after)
         {
-            DebugLog.Write($"mode already kept: {wanted.Width}x{wanted.Height}@{wanted.Hz}Hz");
-            return true;
+            if (before is { } was)
+                DebugLog.Write(after == was
+                    ? $"switch: mode untouched at {after.Width}x{after.Height}@{after.Hz}Hz"
+                    : $"switch: Windows moved the mode {was.Width}x{was.Height}@{was.Hz}Hz -> {after.Width}x{after.Height}@{after.Hz}Hz");
+            else
+                DebugLog.Write($"switch: desktop mode is now {after.Width}x{after.Height}@{after.Hz}Hz");
         }
 
-        RestoreDesktopMode(wanted);
         return true;
     }
 
     /// <summary>
-    /// The mode the desktop is at right now. The external panel is the one present in both layouts,
-    /// and in a mirror it shares the source mode, so its mode is the desktop's either way.
+    /// The mode the desktop is at right now, read only. The external panel is the one present in both
+    /// layouts, and in a mirror it shares the source mode, so its mode is the desktop's either way.
     /// </summary>
     private (int Width, int Height, int Hz)? GetDesktopMode()
         => FindActiveExternal()?.GdiDeviceName is { } gdi ? _displayService.GetCurrentMode(gdi) : null;
 
     private MonitorEntry? FindActiveExternal()
         => _displayService.GetAllMonitors().FirstOrDefault(m => !m.IsInternal && m.IsActive && m.GdiDeviceName is not null);
-
-    /// <summary>
-    /// Puts the desktop back to the mode it had before the switch. The panels need a moment to settle
-    /// into the new layout, so this retries briefly; if it still won't take, Windows' own choice is
-    /// left in place rather than the whole switch being undone.
-    /// </summary>
-    private void RestoreDesktopMode((int Width, int Height, int Hz) mode)
-    {
-        for (int attempt = 1; attempt <= 3; attempt++)
-        {
-            if (FindActiveExternal()?.GdiDeviceName is not { } gdi)
-            {
-                DebugLog.Write($"mode keep: no active external panel to set {mode.Width}x{mode.Height} on");
-                return;
-            }
-
-            if (_displayService.TrySetResolution(gdi, mode.Width, mode.Height, mode.Hz, out var error))
-            {
-                DebugLog.Write($"mode kept: {mode.Width}x{mode.Height}@{mode.Hz} on {gdi}");
-                return;
-            }
-
-            DebugLog.Write($"mode keep attempt {attempt} on {gdi} failed: {error}");
-            Thread.Sleep(150);
-        }
-    }
 
     private void ApplyPowerButtonTakeover(bool enable)
     {
