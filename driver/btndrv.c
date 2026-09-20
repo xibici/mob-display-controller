@@ -25,7 +25,11 @@
 NTSYSAPI NTSTATUS NTAPI ZwCreateEvent(_Out_ PHANDLE EventHandle, _In_ ACCESS_MASK DesiredAccess,
                                       _In_opt_ POBJECT_ATTRIBUTES ObjectAttributes,
                                       _In_ EVENT_TYPE EventType, _In_ BOOLEAN InitialState);
-NTSYSAPI NTSTATUS NTAPI ZwSetEvent(_In_ HANDLE EventHandle, _Out_opt_ PLONG PreviousState);
+NTSYSAPI NTSTATUS NTAPI ObReferenceObjectByHandle(_In_ HANDLE Handle, _In_ ACCESS_MASK DesiredAccess,
+                                                  _In_opt_ POBJECT_TYPE ObjectType,
+                                                  _In_ KPROCESSOR_MODE AccessMode,
+                                                  _Out_ PVOID* Object,
+                                                  _Out_opt_ POBJECT_HANDLE_INFORMATION HandleInformation);
 
 #define BTN_MAGIC      0x42544E44UL     /* 'BTND' */
 #define BTN_LOG_MAX    64
@@ -60,6 +64,7 @@ typedef struct _BTN_BLOB {
     ULONG     ButtonHits;          /* completions of IOCTL_GET_SYS_BUTTON_EVENT that carried SYS_BUTTON_POWER */
     ULONG     LastButtonValue;
     ULONG     QueriesWithData;     /* completions of that ioctl that returned any data at all */
+    ULONG     EventStatus;         /* 0x424E0001 simple name, 0x424E0002 full path, else the NTSTATUS of the failure */
 } BTN_BLOB, *PBTN_BLOB;
 
 static PBTN_BLOB        g_Blob;
@@ -248,20 +253,54 @@ static NTSTATUS BtnEventCompletion(PDEVICE_OBJECT DeviceObject, PIRP Irp, PVOID 
 static VOID BtnCreateObjects(VOID)
 {
     UNICODE_STRING name;
+    OBJECT_ATTRIBUTES attributes;
+    NTSTATUS status;
 
     if (g_EventObject != NULL || KeGetCurrentIrql() != PASSIVE_LEVEL)
         return;
 
-    /* IoCreateNotificationEvent hands back both the handle and the object, and creates the name under
-       \BaseNamedObjects - so user mode opens exactly the same thing as "Global\BtnDrvEvent". */
-    RtlInitUnicodeString(&name, L"Global\\BtnDrvEvent");
+    /* Two attempts, because the documented API and the verified one place the name differently:
+       IoCreateNotificationEvent takes a *plain* name and creates it under \BaseNamedObjects -
+       which is the same object user mode opens as "Global\BtnDrvEvent"; ZwCreateEvent takes a full
+       path, and that is the form this project verified working. Whichever succeeds, the object is
+       needed as well as the handle, because the signal has to come from KeSetEvent (ZwSetEvent is
+       only legal at PASSIVE_LEVEL and the completion can run above it). */
+    RtlInitUnicodeString(&name, L"BtnDrvEvent");
     g_EventObject = IoCreateNotificationEvent(&name, &g_Event);
-    if (g_EventObject == NULL) {
-        g_Event = NULL;
+    if (g_EventObject != NULL) {
+        if (g_Blob != NULL)
+            g_Blob->EventStatus = 0x424E0001;   /* created under \BaseNamedObjects by the plain name */
+        DbgPrint("btndrv: button event created (plain name)\n");
         return;
     }
 
-    DbgPrint("btndrv: event Global\\BtnDrvEvent created\n");
+    RtlInitUnicodeString(&name, L"\\BaseNamedObjects\\Global\\BtnDrvEvent");
+    InitializeObjectAttributes(&attributes, &name,
+                               OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+    status = ZwCreateEvent(&g_Event, EVENT_ALL_ACCESS, &attributes, NotificationEvent, FALSE);
+    if (!NT_SUCCESS(status)) {
+        g_Event = NULL;
+        if (g_Blob != NULL)
+            g_Blob->EventStatus = (ULONG)status;
+        DbgPrint("btndrv: ZwCreateEvent failed 0x%08X\n", status);
+        return;
+    }
+
+    status = ObReferenceObjectByHandle(g_Event, EVENT_MODIFY_STATE, *ExEventObjectType,
+                                       KernelMode, (PVOID*)&g_EventObject, NULL);
+    if (!NT_SUCCESS(status)) {
+        g_EventObject = NULL;
+        ZwClose(g_Event);
+        g_Event = NULL;
+        if (g_Blob != NULL)
+            g_Blob->EventStatus = (ULONG)status;
+        DbgPrint("btndrv: ObReferenceObjectByHandle failed 0x%08X\n", status);
+        return;
+    }
+
+    if (g_Blob != NULL)
+        g_Blob->EventStatus = 0x424E0002;       /* created by the full path, object referenced */
+    DbgPrint("btndrv: button event created (full path)\n");
 }
 
 static NTSTATUS BtnPassThrough(PDEVICE_OBJECT DeviceObject, PIRP Irp)
