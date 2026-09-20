@@ -24,6 +24,13 @@ public sealed class AppSettings
     /// <summary>Same as <see cref="SavedPowerButtonActionAc"/> but for DC (on battery).</summary>
     public uint? SavedPowerButtonActionDc { get; set; }
 
+    /// <summary>The "require a password on wakeup" setting's original AC value, saved before the takeover
+    /// turns it off so the sign-in screen stops appearing after a power-button press.</summary>
+    public uint? SavedConsoleLockAc { get; set; }
+
+    /// <summary>Same as <see cref="SavedConsoleLockAc"/> but for DC (on battery).</summary>
+    public uint? SavedConsoleLockDc { get; set; }
+
     private static string SettingsPath
     {
         get

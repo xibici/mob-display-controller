@@ -275,7 +275,7 @@ public sealed class DisplayService
         // path from the topology instead. Only ever touch an already-active, non-cloned path.
         if (GetTopologyMode() == TopologyMode.Clone)
         {
-            error = "复制模式下无法单独旋转某一块屏幕,请先切换到扩展模式。";
+            error = "复制模式下两块屏同画面,无法单独旋转某一块屏幕,请先切到「仅外屏」。";
             return false;
         }
 
@@ -312,6 +312,61 @@ public sealed class DisplayService
             return true;
 
         error = $"设置旋转失败,错误码 {rc}。";
+        return false;
+    }
+
+    /// <summary>
+    /// Puts every non-built-in panel on the active topology back to rotation 0.
+    ///
+    /// A duplicate hands one rotation to both of its targets, and Windows copies the built-in panel's
+    /// 90 degrees - its panel is physically portrait - onto the external monitor as well, which
+    /// leaves the external showing the picture on its side. Only the built-in needs that rotation.
+    ///
+    /// Done by supplying the paths with the corrected rotation rather than by asking for a rotation
+    /// change: the supplied-configuration form is accepted (verified here, rc=0, both paths still
+    /// active), whereas the "just rotate this target" form is what Windows answers by quietly dropping
+    /// the cloned path.
+    /// </summary>
+    public bool TryNormalizeExternalRotation(out string error)
+    {
+        error = string.Empty;
+
+        if (!TryQueryPaths(Ccd.QDC_ONLY_ACTIVE_PATHS, out var paths, out var modes))
+        {
+            error = "无法读取当前显示器配置 (QueryDisplayConfig 失败)。";
+            return false;
+        }
+
+        bool changed = false;
+
+        for (int i = 0; i < paths.Length; i++)
+        {
+            var path = paths[i];
+
+            bool isInternal = path.targetInfo.outputTechnology
+                is DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY.DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INTERNAL
+                or DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY.DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_EMBEDDED;
+
+            if (isInternal || path.targetInfo.rotation == DISPLAYCONFIG_ROTATION.DISPLAYCONFIG_ROTATION_IDENTITY)
+                continue;
+
+            path.targetInfo.rotation = DISPLAYCONFIG_ROTATION.DISPLAYCONFIG_ROTATION_IDENTITY;
+            paths[i] = path;
+            changed = true;
+        }
+
+        if (!changed)
+            return true;
+
+        int rc = Ccd.SetDisplayConfig(
+            (uint)paths.Length, paths,
+            (uint)modes.Length, modes,
+            Ccd.SDC_APPLY | Ccd.SDC_USE_SUPPLIED_DISPLAY_CONFIG | Ccd.SDC_SAVE_TO_DATABASE);
+
+        if (rc == Ccd.ERROR_SUCCESS)
+            return true;
+
+        error = $"归正外接屏旋转失败,错误码 {rc}。";
         return false;
     }
 

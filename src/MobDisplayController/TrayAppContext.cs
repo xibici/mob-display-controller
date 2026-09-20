@@ -18,11 +18,16 @@ public sealed class TrayAppContext : ApplicationContext
     private readonly MonitorControlService _monitorControlService = new();
     private readonly StartupService _startupService = new();
     private readonly PowerButtonService _powerButtonService = new();
+
+    /// <summary>
+    /// Handle-less control that exists only to give press notifications - which arrive on the
+    /// watcher thread - a way back onto the thread that owns the tray menu.
+    /// </summary>
+    private readonly Control _uiDispatcher = new();
     private readonly AppSettings _settings = AppSettings.Load();
 
-    private DisplayService.TopologyMode? _topologyBeforeScreenOff;
-    private bool _internalOffMode;
     private HotkeyWindow? _recoveryHotkey;
+    private HotkeyWindow? _layoutHotkey;
 
     private ToolStripMenuItem _statusItem = new();
     private ToolStripMenuItem _connectToggleItem = new();
@@ -56,7 +61,11 @@ public sealed class TrayAppContext : ApplicationContext
         // Reconcile the on-disk autostart preference with what's actually in the registry.
         _startupService.SetEnabled(_settings.StartWithWindows);
 
-        _powerButtonService.DisplayTurnedOff += OnDisplayTurnedOff;
+        // Force the dispatcher's handle to exist now, while we are still on the thread that owns the
+        // menu: presses are reported from the watcher thread and are marshalled back through it.
+        _ = _uiDispatcher.Handle;
+
+        _powerButtonService.PowerButtonPressed += OnPowerButtonPressed;
 
         // Ctrl+Alt+Shift+D forces both screens back on, for when you can't see to fix it.
         _recoveryHotkey = new HotkeyWindow(Hotkeys.MOD_CONTROL | Hotkeys.MOD_ALT | Hotkeys.MOD_SHIFT, (uint)Keys.D);
@@ -64,12 +73,37 @@ public sealed class TrayAppContext : ApplicationContext
         if (!_recoveryHotkey.IsRegistered)
             DebugLog.Write("recovery hotkey Ctrl+Alt+Shift+D is already taken - no blind recovery available");
 
+        // Ctrl+Alt+Shift+L switches layouts from the keyboard. This is the route that does not make
+        // the console blank or the machine dip into standby, so it also works over a remote session
+        // where the power button is out of reach.
+        _layoutHotkey = new HotkeyWindow(Hotkeys.MOD_CONTROL | Hotkeys.MOD_ALT | Hotkeys.MOD_SHIFT, (uint)Keys.L);
+        _layoutHotkey.Pressed += OnLayoutHotkey;
+        if (!_layoutHotkey.IsRegistered)
+            DebugLog.Write("layout hotkey Ctrl+Alt+Shift+L is already taken - no keyboard layout switch");
+
         // Reconcile the on-disk preference with the actual power scheme setting, the same way
         // autostart is reconciled above - re-applying "do nothing" is idempotent and guards
         // against the setting having drifted back (e.g. a Windows update reset power schemes).
         if (_settings.PowerButtonTakeoverEnabled)
             ApplyPowerButtonTakeover(true);
     }
+
+    /// <summary>
+    /// True when the built-in panel is part of the desktop right now. A machine with no built-in
+    /// panel at all counts as "active" - there is then nothing to switch off or bring back.
+    /// </summary>
+    private bool IsBuiltInPanelActive()
+    {
+        var builtIn = _displayService.GetAllMonitors().Where(m => m.IsInternal).ToList();
+        return builtIn.Count == 0 || builtIn.Any(m => m.IsActive);
+    }
+
+    /// <summary>
+    /// True when an external panel is part of the desktop. Without one the takeover has nothing to
+    /// do: "external only" would leave no screen at all, and there'd be nothing to keep lit.
+    /// </summary>
+    private bool IsExternalPanelActive()
+        => _displayService.GetAllMonitors().Any(m => !m.IsInternal && m.IsActive);
 
     private void BuildStaticMenuItems()
     {
@@ -90,7 +124,7 @@ public sealed class TrayAppContext : ApplicationContext
             _settings.Save();
         };
 
-        _powerButtonTakeoverMenuItem.Text = "接管电源键(关内屏时外屏保持开启)";
+        _powerButtonTakeoverMenuItem.Text = "接管电源键(按一下在两种显示模式间切换)";
         _powerButtonTakeoverMenuItem.CheckOnClick = true;
         _powerButtonTakeoverMenuItem.Checked = _settings.PowerButtonTakeoverEnabled;
         _powerButtonTakeoverMenuItem.Click += (_, _) => ApplyPowerButtonTakeover(_powerButtonTakeoverMenuItem.Checked);
@@ -124,6 +158,14 @@ public sealed class TrayAppContext : ApplicationContext
 
     private void RefreshMenuSafe()
     {
+        // A press is reported from the watcher thread, so hop back to the menu's thread first -
+        // touching the menu items from the wrong thread throws instead of refreshing.
+        if (_uiDispatcher.InvokeRequired)
+        {
+            try { _uiDispatcher.BeginInvoke(new Action(RefreshMenuSafe)); } catch { }
+            return;
+        }
+
         try { RefreshMenu(); } catch { /* best effort */ }
     }
 
@@ -164,6 +206,21 @@ public sealed class TrayAppContext : ApplicationContext
         BuildVolumeSubmenu(target);
     }
 
+    /// <summary>
+    /// The "both panels on" layout: duplicate - the two panels show the same picture, which is what
+    /// this mode is for.
+    ///
+    /// The built-in panel is a portrait panel that Windows presents landscape with a 90 degree target
+    /// rotation, and the external one is an ordinary landscape monitor, so a duplicate hands the same
+    /// source mode and rotation to both. That inherited rotation is left alone deliberately: it is
+    /// what makes the shared portrait picture come out upright on both panels, and changing one
+    /// target's rotation while they share a source is what previously threw the external monitor off
+    /// its signal. What made the duplicate look unstable before was more likely the mode being
+    /// re-applied after every switch (see TrySwitchLayout) - on a shared source that means touching
+    /// the timing of both panels at once.
+    /// </summary>
+    private const DisplayService.TopologyMode BothScreensMode = DisplayService.TopologyMode.Clone;
+
     private void BuildDisplayModeSubmenu(MonitorEntry target)
     {
         _displayModeMenuItem.DropDownItems.Clear();
@@ -177,43 +234,114 @@ public sealed class TrayAppContext : ApplicationContext
         _displayModeMenuItem.Enabled = true;
         var currentMode = _displayService.GetTopologyMode();
 
-        var cloneItem = new ToolStripMenuItem("复制屏幕 (与主屏同画面)")
-        {
-            Checked = currentMode == DisplayService.TopologyMode.Clone,
-        };
-        cloneItem.Click += (_, _) => ApplyTopology(DisplayService.TopologyMode.Clone);
-
-        var extendItem = new ToolStripMenuItem("扩展屏幕 (作为独立桌面)")
-        {
-            Checked = currentMode == DisplayService.TopologyMode.Extend,
-        };
-        extendItem.Click += (_, _) => ApplyTopology(DisplayService.TopologyMode.Extend);
-
-        var externalOnlyItem = new ToolStripMenuItem("仅外接屏 (关闭内置屏)")
+        // Deliberately only these two. Windows offers four layouts (PC screen only / duplicate /
+        // extend / second screen only), but this device is only ever used with the built-in panel
+        // mirrored to the external one or switched off - keeping the other two around just made the
+        // menu ambiguous, and "second screen only" could strand the built-in panel off with no way
+        // back from the menu.
+        var externalOnlyItem = new ToolStripMenuItem("仅外屏 (关闭内置屏)")
         {
             Checked = currentMode == DisplayService.TopologyMode.ExternalOnly,
         };
         externalOnlyItem.Click += (_, _) => ApplyTopology(DisplayService.TopologyMode.ExternalOnly);
 
-        var internalOnlyItem = new ToolStripMenuItem("仅内置屏 (关闭外接屏)")
+        var bothScreensItem = new ToolStripMenuItem("外屏+内屏 都显示 (同画面)")
         {
-            Checked = currentMode == DisplayService.TopologyMode.InternalOnly,
+            Checked = currentMode == BothScreensMode,
         };
-        internalOnlyItem.Click += (_, _) => ApplyTopology(DisplayService.TopologyMode.InternalOnly);
+        bothScreensItem.Click += (_, _) => ApplyTopology(BothScreensMode);
 
-        _displayModeMenuItem.DropDownItems.Add(cloneItem);
-        _displayModeMenuItem.DropDownItems.Add(extendItem);
-        _displayModeMenuItem.DropDownItems.Add(new ToolStripSeparator());
         _displayModeMenuItem.DropDownItems.Add(externalOnlyItem);
-        _displayModeMenuItem.DropDownItems.Add(internalOnlyItem);
+        _displayModeMenuItem.DropDownItems.Add(bothScreensItem);
     }
 
     private void ApplyTopology(DisplayService.TopologyMode mode)
     {
-        if (!_displayService.TrySetTopology(mode, out var error))
+        if (!TrySwitchLayout(mode, out var error))
             ShowBalloon("切换显示模式失败", error, ToolTipIcon.Error);
 
         RefreshMenu();
+    }
+
+    /// <summary>
+    /// Switches layouts while leaving the desktop at the resolution it already has.
+    ///
+    /// Asking Windows for a topology by name (SDC_TOPOLOGY_CLONE / _EXTERNAL) also lets it pick the
+    /// modes that make that layout valid, which is how mirroring used to drop the desktop to
+    /// 1280x800 - a mode both panels happen to share. So the current mode is captured first and put
+    /// back afterwards; only the panel coming or going changes.
+    /// </summary>
+    private bool TrySwitchLayout(DisplayService.TopologyMode mode, out string error)
+    {
+        var keepMode = GetDesktopMode();
+
+        if (!_displayService.TrySetTopology(mode, out error))
+            return false;
+
+        if (mode == DisplayService.TopologyMode.Clone)
+        {
+            // Building a duplicate copies the built-in panel's 90 degrees onto the external monitor
+            // too, which leaves the external picture lying on its side; only the built-in needs that
+            // rotation. Done before the mode check below, because this is the step that has to happen
+            // on every duplicate switch, not just the ones that also move the mode.
+            if (_displayService.TryNormalizeExternalRotation(out var rotationError))
+                DebugLog.Write("duplicate: external rotation normalised to 0");
+            else
+                DebugLog.Write($"duplicate: external rotation left as Windows set it ({rotationError})");
+        }
+
+        if (keepMode is not { } wanted)
+            return true;
+
+        // Only put the mode back when the switch actually moved it. In a duplicate the two panels
+        // share one source mode and Windows normally keeps the mode that was already there, so most
+        // switches need nothing at all - and re-applying it anyway meant setting a mode on a source
+        // that two panels were sharing, which is what made the external monitor lose its signal and
+        // drop off. "If it is already right, don't touch it."
+        if (GetDesktopMode() is { } now && now == wanted)
+        {
+            DebugLog.Write($"mode already kept: {wanted.Width}x{wanted.Height}@{wanted.Hz}Hz");
+            return true;
+        }
+
+        RestoreDesktopMode(wanted);
+        return true;
+    }
+
+    /// <summary>
+    /// The mode the desktop is at right now. The external panel is the one present in both layouts,
+    /// and in a mirror it shares the source mode, so its mode is the desktop's either way.
+    /// </summary>
+    private (int Width, int Height, int Hz)? GetDesktopMode()
+        => FindActiveExternal()?.GdiDeviceName is { } gdi ? _displayService.GetCurrentMode(gdi) : null;
+
+    private MonitorEntry? FindActiveExternal()
+        => _displayService.GetAllMonitors().FirstOrDefault(m => !m.IsInternal && m.IsActive && m.GdiDeviceName is not null);
+
+    /// <summary>
+    /// Puts the desktop back to the mode it had before the switch. The panels need a moment to settle
+    /// into the new layout, so this retries briefly; if it still won't take, Windows' own choice is
+    /// left in place rather than the whole switch being undone.
+    /// </summary>
+    private void RestoreDesktopMode((int Width, int Height, int Hz) mode)
+    {
+        for (int attempt = 1; attempt <= 3; attempt++)
+        {
+            if (FindActiveExternal()?.GdiDeviceName is not { } gdi)
+            {
+                DebugLog.Write($"mode keep: no active external panel to set {mode.Width}x{mode.Height} on");
+                return;
+            }
+
+            if (_displayService.TrySetResolution(gdi, mode.Width, mode.Height, mode.Hz, out var error))
+            {
+                DebugLog.Write($"mode kept: {mode.Width}x{mode.Height}@{mode.Hz} on {gdi}");
+                return;
+            }
+
+            DebugLog.Write($"mode keep attempt {attempt} on {gdi} failed: {error}");
+            Thread.Sleep(150);
+        }
     }
 
     private void ApplyPowerButtonTakeover(bool enable)
@@ -222,7 +350,7 @@ public sealed class TrayAppContext : ApplicationContext
         {
             // Only remember the pre-takeover action the first time - once the setting is
             // already ours from a previous session, re-reading it would just save our own
-            // "turn off display" over the user's real original action.
+            // "sleep" over the user's real original action.
             if (_settings.SavedPowerButtonActionAc is null || _settings.SavedPowerButtonActionDc is null)
             {
                 var current = _powerButtonService.ReadCurrentAction();
@@ -233,23 +361,47 @@ public sealed class TrayAppContext : ApplicationContext
                 }
             }
 
-            if (!_powerButtonService.TryEnable(out var error))
+            // The press can only be seen through the standby entry it causes, and that round trip is
+            // what used to end on the sign-in screen. Turning "require a password on wakeup" off is
+            // what removes it: the machine now comes back straight to the desktop.
+            if (_settings.SavedConsoleLockAc is null || _settings.SavedConsoleLockDc is null)
             {
-                ShowBalloon("接管电源键失败", error, ToolTipIcon.Error);
+                var currentLock = _powerButtonService.ReadConsoleLock();
+                if (currentLock is not null)
+                {
+                    _settings.SavedConsoleLockAc = currentLock.Value.Ac;
+                    _settings.SavedConsoleLockDc = currentLock.Value.Dc;
+                }
+            }
+
+            if (!_powerButtonService.WriteConsoleLock(0, 0, out var lockError))
+                DebugLog.Write($"could not turn off \"require a password on wakeup\": {lockError}");
+
+            if (!_powerButtonService.TryEnable(_settings.SavedPowerButtonActionAc, _settings.SavedPowerButtonActionDc, out var error))
+            {
+                // The button is untouched, so stop claiming the takeover is on: leave the checkbox
+                // and the saved preference agreeing with what's actually in the power scheme,
+                // instead of retrying (and failing) silently on every launch.
                 _powerButtonTakeoverMenuItem.Checked = false;
+                _settings.PowerButtonTakeoverEnabled = false;
+                RestoreConsoleLock();
+                _settings.Save();
+                ShowBalloon("接管电源键失败", error, ToolTipIcon.Error);
                 return;
             }
         }
         else
         {
-            // Turning the takeover off while the built-in panel is down would leave it down
-            // with no way to bring it back by button, so put the displays back first.
-            if (_internalOffMode)
+            // Turning the takeover off while the built-in panel is down would leave it down with
+            // no way to bring it back by button, so put both panels back before letting go.
+            if (!IsBuiltInPanelActive())
                 ForceRecoverDisplays();
 
             _powerButtonService.Disable(_settings.SavedPowerButtonActionAc, _settings.SavedPowerButtonActionDc);
             _settings.SavedPowerButtonActionAc = null;
             _settings.SavedPowerButtonActionDc = null;
+
+            RestoreConsoleLock();
         }
 
         _settings.PowerButtonTakeoverEnabled = enable;
@@ -257,58 +409,99 @@ public sealed class TrayAppContext : ApplicationContext
     }
 
     /// <summary>
-    /// Runs right after the power button blanked the displays. The first press swaps to
-    /// "external only" and lights the external panel back up; the next press puts the
-    /// original topology back, which is what brings the built-in panel on again.
+    /// Puts "require a password on wakeup" back to the value saved before the takeover turned it off.
     /// </summary>
-    private void OnDisplayTurnedOff()
+    private void RestoreConsoleLock()
     {
-        if (_internalOffMode)
-        {
-            var restoreMode = _topologyBeforeScreenOff ?? DisplayService.TopologyMode.Extend;
-            bool ok = _displayService.TrySetTopology(restoreMode, out var restoreError);
-            DebugLog.Write($"restore -> {restoreMode}: ok={ok} {restoreError}");
-            _internalOffMode = false;
-        }
-        else
-        {
-            var before = _displayService.GetTopologyMode();
+        if (_settings.SavedConsoleLockAc is null || _settings.SavedConsoleLockDc is null)
+            return;
 
-            // Never record ExternalOnly as the state to come back to - the built-in panel is
-            // already off in that mode, so restoring it would leave it off forever and the
-            // button would look dead no matter how many times it's pressed.
-            _topologyBeforeScreenOff = before is DisplayService.TopologyMode.ExternalOnly or DisplayService.TopologyMode.Unknown
-                ? DisplayService.TopologyMode.Extend
-                : before;
+        if (!_powerButtonService.WriteConsoleLock(_settings.SavedConsoleLockAc.Value, _settings.SavedConsoleLockDc.Value, out var error))
+            DebugLog.Write($"could not restore \"require a password on wakeup\": {error}");
 
-            bool ok = _displayService.TrySetTopology(DisplayService.TopologyMode.ExternalOnly, out var offError);
-            DebugLog.Write($"internal off (was {before}, will restore to {_topologyBeforeScreenOff}) -> ExternalOnly: ok={ok} {offError}");
+        _settings.SavedConsoleLockAc = null;
+        _settings.SavedConsoleLockDc = null;
+    }
 
-            if (!ok)
-            {
-                // Couldn't drop the internal panel - don't leave everything blanked.
-                _powerButtonService.ForceDisplaysOn();
-                return;
-            }
-            _internalOffMode = true;
-        }
-
-        // The button left every panel in DPMS standby; wake whatever is still attached.
-        // A monitor we just deactivated at the CCD level stays dark regardless.
+    /// <summary>
+    /// Runs when Windows reports that it entered standby because the power button was pressed, and
+    /// flips between the two layouts the menu offers: "external only" and "both screens" (mirrored).
+    ///
+    /// The signal is the reason code on the standby entry (Kernel-Power 506, Reason = power button),
+    /// not the console going dark: an idle blank, a driver reset or our own display switch all look
+    /// like "displays off", and reading those as presses is what used to flip the screens on their own.
+    ///
+    /// Which way to flip is read from what the panels are actually doing rather than from a flag
+    /// remembered between presses. That's deliberate: a remembered flag has to survive a reboot to
+    /// keep working, and the reboot an OS update performs restored the saved topology (built-in
+    /// panel still off) while wiping the flag - so the next press pushed the wrong way, turning the
+    /// built-in panel off again instead of bringing it back. Reading the panels removes that state.
+    /// </summary>
+    private void OnPowerButtonPressed()
+    {
+        // Wake first: the standby entry the press was reported through would otherwise keep the
+        // panels dark for the whole round trip. A monitor we deactivate at the CCD level in the
+        // switch below stays dark regardless.
         _powerButtonService.ForceDisplaysOn();
+
+        ToggleLayout("press");
         RefreshMenuSafe();
     }
 
     /// <summary>
-    /// Escape hatch for when the screens are in a state you can't see to fix: forces both
-    /// displays back to extend and powers them on. Usable blind, by feel.
+    /// Flips between the two layouts the menu offers: "external only" and both panels showing.
+    ///
+    /// Deliberately shared with the layout hotkey: the hotkey exists because the button route cannot
+    /// avoid the console blanking and the machine dipping into standby - which on this hardware
+    /// means the lock screen on the way back - so there has to be a way to switch without it.
+    /// </summary>
+    private bool ToggleLayout(string trigger)
+    {
+        // Nothing to switch with no external panel on the desktop: "external only" on its own would
+        // leave no screen at all.
+        if (!IsExternalPanelActive())
+        {
+            DebugLog.Write($"{trigger}: ignored, no active external panel to switch to");
+            return false;
+        }
+
+        bool builtInWasOn = IsBuiltInPanelActive();
+        bool ok;
+        string error;
+
+        if (builtInWasOn)
+            ok = TrySwitchLayout(DisplayService.TopologyMode.ExternalOnly, out error);
+        else
+            ok = TryShowBothScreens(out error);
+
+        DebugLog.Write($"{trigger}: built-in was {(builtInWasOn ? "on" : "off")} -> {(builtInWasOn ? "external only" : "both screens")}: ok={ok} {error}");
+        return ok;
+    }
+
+    /// <summary>
+    /// Brings both panels back on, in the layout the menu offers. Kept as a named step so the
+    /// recovery path and the button toggle both read the same way.
+    /// </summary>
+    private bool TryShowBothScreens(out string error)
+        => TrySwitchLayout(BothScreensMode, out error);
+
+    /// <summary>
+    /// Escape hatch for when the screens are in a state you can't see to fix: brings both panels
+    /// back on and powers them up. Usable blind, by feel.
     /// </summary>
     private void ForceRecoverDisplays()
     {
-        _internalOffMode = false;
-        _topologyBeforeScreenOff = null;
-        _displayService.TrySetTopology(DisplayService.TopologyMode.Extend, out _);
+        bool ok = TryShowBothScreens(out var error);
+        DebugLog.Write($"recovery: both screens on: ok={ok} {error}");
+
         _powerButtonService.ForceDisplaysOn();
+        RefreshMenuSafe();
+    }
+
+    /// <summary>Ctrl+Alt+Shift+L: the same toggle the power button does, minus the blank and standby.</summary>
+    private void OnLayoutHotkey()
+    {
+        ToggleLayout("hotkey");
         RefreshMenuSafe();
     }
 
@@ -391,7 +584,7 @@ public sealed class TrayAppContext : ApplicationContext
         if (_displayService.GetTopologyMode() == DisplayService.TopologyMode.Clone)
         {
             _rotationMenuItem.Enabled = false;
-            _rotationMenuItem.DropDownItems.Add(new ToolStripMenuItem("复制模式下无法单独旋转,请先切换到扩展模式") { Enabled = false });
+            _rotationMenuItem.DropDownItems.Add(new ToolStripMenuItem("复制模式下两块屏同画面,无法单独旋转;请先切到「仅外屏」") { Enabled = false });
             return;
         }
 
@@ -640,6 +833,7 @@ public sealed class TrayAppContext : ApplicationContext
         // that action is a perfectly usable button behaviour on its own.
         _powerButtonService.Dispose();
         _recoveryHotkey?.Dispose();
+        _layoutHotkey?.Dispose();
 
         _trayIcon.Visible = false;
         _trayIcon.Dispose();

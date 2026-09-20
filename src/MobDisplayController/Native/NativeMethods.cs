@@ -427,6 +427,26 @@ internal static class Power
     public const int PBT_POWERSETTINGCHANGE = 0x8013;
     public const int DEVICE_NOTIFY_WINDOW_HANDLE = 0;
 
+    /// <summary>
+    /// Permission request sent (as a broadcast every top-level window sees) *before* the machine
+    /// suspends. Returning <see cref="BROADCAST_QUERY_DENY"/> cancels the transition - including the
+    /// display blank that would otherwise come with it. This is what lets the takeover notice a
+    /// power-button press without the machine ever going to sleep.
+    /// </summary>
+    public const int PBT_APMQUERYSUSPEND = 0x0000;
+
+    /// <summary>Sent when a suspend request was refused, by us or by another app.</summary>
+    public const int PBT_APMQUERYSUSPENDFAILED = 0x0002;
+
+    /// <summary>Sent once the suspend is already committed and can no longer be stopped.</summary>
+    public const int PBT_APMSUSPEND = 0x0004;
+
+    /// <summary>
+    /// Veto value for a suspend request: "BMQD" in ASCII, straight out of WinUser.h
+    /// (`#define BROADCAST_QUERY_DENY 0x424D5144`). Not 0xFFFFFFFF, despite what the older
+    /// documentation snippets suggest.</summary>
+    public static readonly IntPtr BROADCAST_QUERY_DENY = new(0x424D5144);
+
     /// <summary>SUB_BUTTONS: the "power and sleep buttons and lid" power settings subgroup.</summary>
     public static readonly Guid GUID_BUTTONS_SUBGROUP = new("4f971e89-eebd-4455-a8de-9e59040e7347");
 
@@ -435,6 +455,13 @@ internal static class Power
 
     /// <summary>GUID_CONSOLE_DISPLAY_STATE: fires with 0 = off, 1 = on, 2 = dimmed whenever the console display's power state actually changes.</summary>
     public static readonly Guid GUID_CONSOLE_DISPLAY_STATE = new("6fe69556-704a-47a0-8f24-c28d936fda47");
+
+    /// <summary>SUB_NONE: the subgroup that holds the "require a password on wakeup" setting.</summary>
+    public static readonly Guid GUID_NONE_SUBGROUP = new("fea3413e-7e05-4911-9a71-700331f1c294");
+
+    /// <summary>CONSOLELOCK ("require a password on wakeup"): 0 lets Windows resume straight to the desktop,
+    /// which is what keeps a power-button press from ending on the sign-in screen.</summary>
+    public static readonly Guid GUID_CONSOLE_LOCK = new("0e796bdb-100d-47d6-a2d5-f7d2daa51f51");
 
     // PBUTTONACTION value indices, as enumerated by "powercfg /q SCHEME_CURRENT SUB_BUTTONS PBUTTONACTION".
     public const uint PBUTTON_DO_NOTHING = 0;
@@ -454,6 +481,40 @@ internal static class Power
 
     public const uint SMTO_ABORTIFHUNG = 0x0002;
 
+    public const uint INPUT_MOUSE = 0;
+    public const uint MOUSEEVENTF_MOVE = 0x0001;
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct MOUSEINPUT
+    {
+        public int dx;
+        public int dy;
+        public uint mouseData;
+        public uint dwFlags;
+        public uint time;
+        public IntPtr dwExtraInfo;
+    }
+
+    /// <summary>
+    /// Declared with the mouse member only, which is the largest member of the native union, so the
+    /// struct size matches the native INPUT (40 bytes on x64).
+    /// </summary>
+    [StructLayout(LayoutKind.Sequential)]
+    public struct INPUT
+    {
+        public uint type;
+        public MOUSEINPUT mi;
+    }
+
+    /// <summary>
+    /// Injects input events. Used to wake the panels: a synthetic input event is a wake source the
+    /// platform always honours, unlike SC_MONITORPOWER, which is documented as unsupported on Modern
+    /// Standby systems - and empirically left the panels dark for ten to eighteen seconds after a
+    /// press on this machine.
+    /// </summary>
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
+
     /// <summary>
     /// Always use the timeout form for HWND_BROADCAST: plain SendMessage waits for every
     /// top-level window in the session, so one hung window blocks the caller indefinitely -
@@ -471,6 +532,26 @@ internal static class Power
 
     [DllImport("user32.dll")]
     public static extern bool GetLastInputInfo(ref LASTINPUTINFO plii);
+
+    /// <summary>See https://learn.microsoft.com/windows/win32/api/winbase/nf-winbase-setthreadexecutionstate </summary>
+    public const uint ES_CONTINUOUS = 0x80000000;
+
+    /// <summary>Keeps the system in the working state (no automatic sleep). Does not keep the display on.</summary>
+    public const uint ES_SYSTEM_REQUIRED = 0x00000001;
+
+    /// <summary>
+    /// Asks for "away mode" instead of sleep: the system keeps running while the display is off,
+    /// which is exactly the shape of a power-button takeover. Ignored on platforms without BIOS
+    /// away-mode support, in which case ES_SYSTEM_REQUIRED has to carry it.
+    /// </summary>
+    public const uint ES_AWAYMODE_REQUIRED = 0x00000040;
+
+    /// <summary>
+    /// Per-thread: the request belongs to the thread that set it and dies with it, so this must be
+    /// called from - and cleared on - the same (UI) thread.
+    /// </summary>
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern uint SetThreadExecutionState(uint esFlags);
 
     [DllImport("user32.dll", SetLastError = true)]
     public static extern IntPtr RegisterPowerSettingNotification(IntPtr hRecipient, ref Guid PowerSettingGuid, int Flags);
