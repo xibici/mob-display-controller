@@ -836,10 +836,20 @@ public sealed class TrayAppContext : ApplicationContext
 
     private void ExitApplication()
     {
-        // Only stop listening - leave the power scheme's "turn off display" action in place,
-        // since the point of the takeover is that it keeps working across app restarts, and
-        // that action is a perfectly usable button behaviour on its own.
-        _powerButtonService.Dispose();
+        // Put back what the takeover changed before going away.
+        //
+        // This used to just stop listening and leave the action alone, on the grounds that the action
+        // is a perfectly usable button behaviour by itself - true while it was "sleep". With the
+        // filter driver the button is set to "do nothing", so leaving it would make the button dead
+        // until the app is started again (no sleep, no anything).
+        //
+        // The *preference* is deliberately left on, so the next launch re-arms it; only the machine's
+        // state is restored.
+        _powerButtonService.Disable(_settings.SavedPowerButtonActionAc, _settings.SavedPowerButtonActionDc);
+        RestoreConsoleLock();
+        _settings.Save();
+        DebugLog.Write("exiting: power button action and wake-password setting restored");
+
         _recoveryHotkey?.Dispose();
         _layoutHotkey?.Dispose();
 
