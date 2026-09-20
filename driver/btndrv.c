@@ -30,6 +30,40 @@ NTSYSAPI NTSTATUS NTAPI ObReferenceObjectByHandle(_In_ HANDLE Handle, _In_ ACCES
                                                   _In_ KPROCESSOR_MODE AccessMode,
                                                   _Out_ PVOID* Object,
                                                   _Out_opt_ POBJECT_HANDLE_INFORMATION HandleInformation);
+NTSYSAPI NTSTATUS NTAPI ZwOpenEvent(_Out_ PHANDLE EventHandle, _In_ ACCESS_MASK DesiredAccess,
+                                    _In_ POBJECT_ATTRIBUTES ObjectAttributes);
+NTSYSAPI NTSTATUS NTAPI ZwWaitForSingleObject(_In_ HANDLE Handle, _In_ BOOLEAN Alertable,
+                                              _In_opt_ PLARGE_INTEGER Timeout);
+
+/* Same story for the security descriptor helpers, and for the two types ntddk.h does not bring in.
+   The structures below are deliberately not called SECURITY_DESCRIPTOR / SID_IDENTIFIER_AUTHORITY:
+   they only have to be layout-identical to the real ones, which they are, and this keeps the file
+   self-contained without pulling in ntifs.h (which cannot be combined with ntddk.h). */
+typedef struct _BTN_SID_AUTHORITY { UCHAR Value[6]; } BTN_SID_AUTHORITY;
+
+typedef struct _BTN_SECURITY_DESCRIPTOR {
+    UCHAR   Revision;
+    UCHAR   Sbz1;
+    USHORT  Control;
+    PSID    Owner;
+    PSID    Group;
+    PACL    Sacl;
+    PACL    Dacl;
+} BTN_SECURITY_DESCRIPTOR;
+
+NTSYSAPI NTSTATUS NTAPI RtlInitializeSid(PSID Sid, const BTN_SID_AUTHORITY* IdentifierAuthority,
+                                         UCHAR SubAuthorityCount);
+NTSYSAPI PULONG   NTAPI RtlSubAuthoritySid(PSID Sid, ULONG SubAuthority);
+NTSYSAPI NTSTATUS NTAPI RtlCreateAcl(PACL Acl, ULONG AclLength, ULONG AclRevision);
+NTSYSAPI NTSTATUS NTAPI RtlAddAccessAllowedAce(PACL Acl, ULONG AceRevision, ACCESS_MASK AccessMask,
+                                               PSID Sid);
+NTSYSAPI NTSTATUS NTAPI RtlCreateSecurityDescriptor(PVOID SecurityDescriptor, ULONG Revision);
+NTSYSAPI NTSTATUS NTAPI RtlSetOwnerSecurityDescriptor(PVOID SecurityDescriptor, PSID Owner,
+                                                      BOOLEAN OwnerDefaulted);
+NTSYSAPI NTSTATUS NTAPI RtlSetGroupSecurityDescriptor(PVOID SecurityDescriptor, PSID Group,
+                                                      BOOLEAN GroupDefaulted);
+NTSYSAPI NTSTATUS NTAPI RtlSetDaclSecurityDescriptor(PVOID SecurityDescriptor, BOOLEAN DaclPresent,
+                                                     PACL Dacl, BOOLEAN DaclDefaulted);
 
 #define BTN_MAGIC      0x42544E44UL     /* 'BTND' */
 #define BTN_LOG_MAX    64
@@ -73,6 +107,9 @@ static HANDLE           g_Key;
 static HANDLE           g_ServiceKey;
 static HANDLE           g_Event;            /* named event handle */
 static PKEVENT          g_EventObject;      /* the same event as an object: KeSetEvent works at any IRQL */
+static HANDLE           g_EventThreadHandle;    /* kept open so unload can wait for the thread to leave */
+static LONG             g_EventThreadStarted;   /* claimed once, with an interlocked exchange */
+static LONG             g_EventThreadStop;      /* set by unload: the thread must return before the image goes */
 static WCHAR            g_ServicePathBuffer[256];
 static UNICODE_STRING   g_ServicePath;
 static LARGE_INTEGER    g_LastWrite;
@@ -121,7 +158,8 @@ static VOID BtnFlush(VOID)
 }
 
 static VOID BtnCreateKey(VOID);
-static VOID BtnCreateObjects(VOID);
+static VOID BtnCreateEventThread(PVOID Context);
+static VOID BtnStartEventThread(VOID);
 static VOID BtnFlush(VOID);
 
 static VOID BtnRecord(UCHAR Major, UCHAR Minor, ULONG Ioctl)
@@ -163,8 +201,7 @@ static VOID BtnRecord(UCHAR Major, UCHAR Minor, ULONG Ioctl)
         KeQuerySystemTime(&stamp);
         if (g_Key == NULL)
             BtnCreateKey();     /* retry: the first attempt can be too early in boot */
-        if (g_EventObject == NULL)
-            BtnCreateObjects(); /* same reason: the first ioctl may arrive before a session exists */
+        BtnStartEventThread();  /* likewise: only does anything if the attempt at load time failed */
         if ((stamp.QuadPart - g_LastWrite.QuadPart) / 10000 > BTN_MIN_WRITE) {
             g_LastWrite = stamp;
             BtnFlush();
@@ -247,60 +284,126 @@ static NTSTATUS BtnEventCompletion(PDEVICE_OBJECT DeviceObject, PIRP Irp, PVOID 
     return STATUS_CONTINUE_COMPLETION;
 }
 
-/* The named event has to exist before user mode can open it, and it can only be created from a
-   context where object calls are legal - the first request after a session exists is as good a
-   moment as any, and the call is a cheap no-op once it has succeeded. */
-static VOID BtnCreateObjects(VOID)
+/* The event has to be openable by the tray app, and that is the part that turned out to be hard.
+   An object created by a kernel call with no security descriptor gets a default one derived from
+   the creating token - and because the object's owner then comes out as whoever that was, Windows
+   derives the object's default *mandatory label* from the owner as well. Created from a request
+   context the owner can be SYSTEM (the power manager polls this device early in boot), which puts a
+   System integrity label on the object - and a High-integrity user process asking for
+   EVENT_MODIFY_STATE is then doing a "write up", so it is refused with access denied even though
+   the object exists and the name resolves perfectly. That is what made this intermittent: it
+   depended on which request created the event first.
+   So the descriptor is built explicitly: Everyone may signal and wait on it, and the owner is a SID
+   that is not SYSTEM so the derived label stays ordinary. The storage is static because the
+   descriptor has to remain valid for as long as the object does. */
+static ULONG g_EventSidBuffer[16];
+static ULONG g_EventAclBuffer[32];
+static BTN_SECURITY_DESCRIPTOR g_EventSd;
+
+static VOID BtnBuildEventSecurity(VOID)
+{
+    static const BTN_SID_AUTHORITY world = { { 0, 0, 0, 0, 0, 1 } };   /* SECURITY_WORLD_SID_AUTHORITY */
+    PSID sid = (PSID)g_EventSidBuffer;
+    PACL acl = (PACL)g_EventAclBuffer;
+
+    RtlInitializeSid(sid, &world, 1);
+    *RtlSubAuthoritySid(sid, 0) = 0;                        /* SECURITY_WORLD_RID => S-1-1-0 */
+    RtlCreateAcl(acl, sizeof(g_EventAclBuffer), ACL_REVISION);
+    RtlAddAccessAllowedAce(acl, ACL_REVISION, EVENT_ALL_ACCESS, sid);
+
+    RtlCreateSecurityDescriptor(&g_EventSd, SECURITY_DESCRIPTOR_REVISION);
+    RtlSetOwnerSecurityDescriptor(&g_EventSd, sid, FALSE);
+    RtlSetGroupSecurityDescriptor(&g_EventSd, sid, FALSE);
+    RtlSetDaclSecurityDescriptor(&g_EventSd, TRUE, acl, FALSE);
+}
+
+/* Spawns the one system thread that owns the named event. Requests can arrive on several CPUs at
+   once, so "already started" is claimed with an interlocked exchange and the loser backs off; a
+   failed spawn is not fatal either, it is retried from the next request. The thread object is kept
+   because BtnUnload has to wait for the thread rather than unmap the code underneath it. */
+static VOID BtnStartEventThread(VOID)
+{
+    HANDLE thread = NULL;
+
+    if (g_EventObject != NULL || g_EventThreadStarted != 0)
+        return;
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL)
+        return;
+    if (InterlockedCompareExchange(&g_EventThreadStarted, 1, 0) != 0)
+        return;
+
+    if (!NT_SUCCESS(PsCreateSystemThread(&thread, THREAD_ALL_ACCESS, NULL, NULL, NULL,
+                                         BtnCreateEventThread, NULL))) {
+        g_EventThreadStarted = 0;       /* let a later request try again */
+        return;
+    }
+
+    /* The handle is kept (not closed) so that unload can wait for the thread: waiting on a handle
+       cannot fail the way an object reference can, and there is then no path that leaves the thread
+       running in an unmapped image. */
+    g_EventThreadHandle = thread;
+}
+
+/* The event is created by a system thread rather than from a request's dispatch context, and the
+   reason is privilege, not location: assigning an explicit owner to the object needs
+   SeRestorePrivilege, which a system thread has (it runs with the system token) and an arbitrary
+   caller's context may not. Measured: the object lands in the global namespace either way, so what
+   the thread buys is a descriptor that is built identically on every boot. Requests used to race to
+   be the one that created the event, and which context won that race decided whether the app could
+   open the result. The attempt is retried, since the first one can run before the object namespace
+   is ready. */
+static VOID BtnCreateEventThread(PVOID Context)
 {
     UNICODE_STRING name;
     OBJECT_ATTRIBUTES attributes;
     NTSTATUS status;
+    LARGE_INTEGER delay;
 
-    if (g_EventObject != NULL || KeGetCurrentIrql() != PASSIVE_LEVEL)
-        return;
+    UNREFERENCED_PARAMETER(Context);
 
-    /* Two attempts, because the documented API and the verified one place the name differently:
-       IoCreateNotificationEvent takes a *plain* name and creates it under \BaseNamedObjects -
-       which is the same object user mode opens as "Global\BtnDrvEvent"; ZwCreateEvent takes a full
-       path, and that is the form this project verified working. Whichever succeeds, the object is
-       needed as well as the handle, because the signal has to come from KeSetEvent (ZwSetEvent is
-       only legal at PASSIVE_LEVEL and the completion can run above it). */
-    RtlInitUnicodeString(&name, L"BtnDrvEvent");
-    g_EventObject = IoCreateNotificationEvent(&name, &g_Event);
-    if (g_EventObject != NULL) {
-        if (g_Blob != NULL)
-            g_Blob->EventStatus = 0x424E0001;   /* created under \BaseNamedObjects by the plain name */
-        DbgPrint("btndrv: button event created (plain name)\n");
-        return;
-    }
+    BtnBuildEventSecurity();
 
-    RtlInitUnicodeString(&name, L"\\BaseNamedObjects\\Global\\BtnDrvEvent");
-    InitializeObjectAttributes(&attributes, &name,
-                               OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
-    status = ZwCreateEvent(&g_Event, EVENT_ALL_ACCESS, &attributes, NotificationEvent, FALSE);
-    if (!NT_SUCCESS(status)) {
-        g_Event = NULL;
+    for (;;) {
+        BOOLEAN opened = FALSE;
+
+        if (g_EventThreadStop)
+            break;                          /* see BtnUnload: this code is about to be unmapped */
+
+        RtlInitUnicodeString(&name, L"\\BaseNamedObjects\\Global\\BtnDrvEvent");
+        InitializeObjectAttributes(&attributes, &name,
+                                   OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, &g_EventSd);
+
+        /* A collision means the object outlived a previous load - the tray app holding a handle is
+           enough to keep it alive - so open it rather than treating that as a failure. The descriptor
+           is the one built above either way, since nothing else creates an object under this name. */
+        status = ZwCreateEvent(&g_Event, EVENT_ALL_ACCESS, &attributes, NotificationEvent, FALSE);
+        if (status == STATUS_OBJECT_NAME_COLLISION) {
+            opened = TRUE;
+            status = ZwOpenEvent(&g_Event, EVENT_ALL_ACCESS, &attributes);
+        }
+        if (NT_SUCCESS(status)) {
+            status = ObReferenceObjectByHandle(g_Event, EVENT_MODIFY_STATE, *ExEventObjectType,
+                                                KernelMode, (PVOID*)&g_EventObject, NULL);
+            if (NT_SUCCESS(status)) {
+                if (g_Blob != NULL)
+                    g_Blob->EventStatus = opened ? 0x424E0004 : 0x424E0003;
+                BtnFlush();
+                DbgPrint("btndrv: button event ready (%s)\n", opened ? "opened" : "created");
+                break;
+            }
+
+            ZwClose(g_Event);
+            g_Event = NULL;
+        }
+
         if (g_Blob != NULL)
             g_Blob->EventStatus = (ULONG)status;
-        DbgPrint("btndrv: ZwCreateEvent failed 0x%08X\n", status);
-        return;
+
+        delay.QuadPart = -5000000;      /* 500 ms */
+        KeDelayExecutionThread(KernelMode, FALSE, &delay);
     }
 
-    status = ObReferenceObjectByHandle(g_Event, EVENT_MODIFY_STATE, *ExEventObjectType,
-                                       KernelMode, (PVOID*)&g_EventObject, NULL);
-    if (!NT_SUCCESS(status)) {
-        g_EventObject = NULL;
-        ZwClose(g_Event);
-        g_Event = NULL;
-        if (g_Blob != NULL)
-            g_Blob->EventStatus = (ULONG)status;
-        DbgPrint("btndrv: ObReferenceObjectByHandle failed 0x%08X\n", status);
-        return;
-    }
-
-    if (g_Blob != NULL)
-        g_Blob->EventStatus = 0x424E0002;       /* created by the full path, object referenced */
-    DbgPrint("btndrv: button event created (full path)\n");
+    PsTerminateSystemThread(STATUS_SUCCESS);
 }
 
 static NTSTATUS BtnPassThrough(PDEVICE_OBJECT DeviceObject, PIRP Irp)
@@ -336,7 +439,6 @@ static NTSTATUS BtnPassThrough(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         /* Take a copy of the stack location so the request can be followed to its completion -
            the answer is what says the button was pressed. Everything else stays a memcpy-free
            skip; only this one ioctl pays for the extra plumbing. */
-        BtnCreateObjects();
         IoCopyCurrentIrpStackLocationToNext(Irp);
         IoSetCompletionRoutine(Irp, BtnEventCompletion, NULL, TRUE, TRUE, TRUE);
         return IoCallDriver(g_Lower, Irp);
@@ -394,6 +496,16 @@ static VOID BtnUnload(PDRIVER_OBJECT DriverObject)
 {
     UNREFERENCED_PARAMETER(DriverObject);
 
+    /* Stop the event thread first, and wait for it to actually leave: it is running this driver's
+       code, and once this routine returns the image can be unmapped. Nothing below may be touched
+       until it has terminated, which it does at most one retry interval after the flag is set. */
+    g_EventThreadStop = 1;
+    if (g_EventThreadHandle != NULL) {
+        ZwWaitForSingleObject(g_EventThreadHandle, FALSE, NULL);
+        ZwClose(g_EventThreadHandle);
+        g_EventThreadHandle = NULL;
+    }
+
     if (g_Self != NULL) {
         if (g_Lower != NULL)
             IoDetachDevice(g_Lower);
@@ -445,7 +557,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 
     RtlZeroMemory(g_Blob, sizeof(BTN_BLOB));
     g_Blob->Magic = BTN_MAGIC;
-    g_Blob->Version = 2;
+    g_Blob->Version = 3;
     g_Blob->Stage = 1;
 
     if (RegistryPath != NULL && RegistryPath->Length > 0 &&
@@ -464,8 +576,10 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 
     /* Loaded at boot with no user session around, so the key is created on demand - but only
        from a context where a registry call is legal, and once at most. */
-    if (KeGetCurrentIrql() == PASSIVE_LEVEL)
+    if (KeGetCurrentIrql() == PASSIVE_LEVEL) {
         BtnCreateKey();
+        BtnStartEventThread();
+    }
 
     BtnFlush();
 

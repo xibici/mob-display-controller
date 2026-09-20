@@ -28,13 +28,47 @@ bcdedit /set testsigning on | Out-Null
 Write-Host ('   testsigning now: ' + ((bcdedit /enum '{current}') | Select-String 'testsigning').Line.Trim())
 
 Write-Host '2) copying the driver'
-$target = Join-Path $env:SystemRoot 'System32\drivers\btndrv.sys'
-Copy-Item $DriverFile $target -Force
+# A filter driver that is attached to a PnP device cannot be stopped, so the file it was loaded
+# from stays locked until the next reboot. Deploying to a second name sidesteps that: whichever of
+# the two names is not currently loaded is free, so a new build can always be installed with a
+# single reboot. The service name (and therefore UpperFilters) never changes.
+$candidates = @('btndrv.sys', 'btndrv_alt.sys')
+$target = $null
+$lastError = $null
+foreach ($name in $candidates) {
+    $candidate = Join-Path $env:SystemRoot "System32\drivers\$name"
+    try {
+        if (Test-Path $candidate) {
+            # Read access with no sharing is the test: an image the loader has mapped cannot be opened
+            # at all, while read-only avoids reporting a write-protected file as "locked".
+            $stream = [System.IO.File]::Open($candidate, 'Open', 'Read', 'None')
+            $stream.Close()
+        }
+        Copy-Item $DriverFile $candidate -Force
+        $target = $candidate
+        break
+    } catch {
+        $lastError = $_.Exception.Message
+        Write-Host "   $name is in use by the running driver - trying the other name"
+        $target = $null
+    }
+}
+if (-not $target) { throw "both driver file names are unusable - reboot first, then run this again (last error: $lastError)" }
 Write-Host "   $target"
 
 Write-Host '3) creating the demand-start kernel service'
-sc.exe delete $ServiceName 2>$null | Out-Null
-sc.exe create $ServiceName binpath= "$target" type= kernel start= demand error= normal
+# The service cannot be deleted while it is loaded, and a failed create would leave binpath pointing
+# at the previous file - so the image path is always written explicitly and then read back.
+$exists = $null -ne (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue)
+if (-not $exists) {
+    sc.exe create $ServiceName binpath= "$target" type= kernel start= demand error= normal | Out-Null
+}
+sc.exe config $ServiceName binpath= "$target" start= demand | Out-Null
+$configured = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName").ImagePath
+if ($configured -notmatch [regex]::Escape($target)) {
+    throw "the service still points at '$configured' instead of '$target'"
+}
+Write-Host "   ImagePath = $configured"
 
 Write-Host '4) attaching it as an upper filter of the button device'
 $existing = (Get-ItemProperty $DeviceKey -ErrorAction SilentlyContinue).UpperFilters

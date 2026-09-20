@@ -372,9 +372,15 @@ public sealed class PowerButtonService : IDisposable
     /// <summary>
     /// Issues one button request and then opens the named event the driver creates.
     ///
-    /// The request matters: the driver only creates the event while handling that ioctl, and a press
-    /// that has already happened cannot be replayed - so the event has to exist before the user
-    /// presses the button, not after.
+    /// The driver creates the event itself when it loads, from a system thread - not because of
+    /// anything to do with sessions (measured: the object lands in the global namespace either way)
+    /// but because that thread has the privileges needed to give the object an explicit owner, which
+    /// is what keeps it openable by this process. The request here is still worth making: it proves
+    /// the device opens at all, and it brings the stack up if the driver was installed seconds ago.
+    ///
+    /// The two ways this can fail are logged apart, because they mean opposite things:
+    /// ERROR_FILE_NOT_FOUND says there is no object by that name (nothing listening), while access
+    /// denied says the object is right there and this process is not allowed to use it.
     /// </summary>
     private bool TryOpenDriverEvent()
     {
@@ -383,20 +389,40 @@ public sealed class PowerButtonService : IDisposable
             ButtonDevice.Poke(out var detail);
             DebugLog.Write($"button device poke: {detail}");
 
-            for (var attempt = 0; attempt < 12; attempt++)
+            // Four attempts at 200 ms. The event is created at driver load time, well before this app
+            // runs, so the first attempt is the one that normally succeeds; the retries only cover a
+            // driver installed a moment ago. They are kept short because this runs on the UI thread.
+            for (var attempt = 0; attempt < 4; attempt++)
             {
                 try
                 {
                     _driverEvent = EventWaitHandle.OpenExisting(@"Global\BtnDrvEvent");
+
+                    // It is a manual-reset event and the driver never clears it, so a press that
+                    // happened while this app was not running is still signalled. Consuming that here
+                    // is what stops a stale signal from becoming a display switch at startup.
+                    _driverEvent.Reset();
+
+                    if (attempt > 0)
+                        DebugLog.Write($"driver event appeared after {attempt * 200} ms");
                     return true;
                 }
                 catch (WaitHandleCannotBeOpenedException)
                 {
-                    Thread.Sleep(150);
+                    // ERROR_FILE_NOT_FOUND: no object with that name in the global namespace yet.
+                    Thread.Sleep(200);
+                }
+                catch (Exception ex)
+                {
+                    // Most importantly access denied - the object exists but is not usable here.
+                    DebugLog.Write(
+                        $"driver event exists but cannot be opened: {ex.GetType().Name}: {ex.Message}");
+                    return false;
                 }
             }
 
-            DebugLog.Write(@"named event Global\BtnDrvEvent did not appear - driver not installed?");
+            DebugLog.Write(
+                @"named event Global\BtnDrvEvent did not appear in 0.8 s - the driver is not reporting");
             return false;
         }
         catch (Exception ex)
