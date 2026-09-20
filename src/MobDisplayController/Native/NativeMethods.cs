@@ -411,6 +411,80 @@ internal static class MonitorApi
 
 #endregion
 
+#region Power button device (ACPI fixed button + the ioctl Windows uses to poll it)
+
+/// <summary>
+/// The ACPI power button device and the request Windows itself sends to it to find out whether the
+/// button was pressed.
+///
+/// User mode never gets a non-zero answer from this ioctl - measured: 13276 polls across a real
+/// press, every one returning 0 - while the system's own request is the one that is answered. That
+/// is why the filter driver (btndrv) sits above this device and reads the *completion* of the
+/// system's request. This type exists so the app can (a) check the device is there and (b) issue one
+/// request at startup, which is what makes the driver create its named event.
+/// </summary>
+internal static class ButtonDevice
+{
+    /// <summary>\\?\ACPI#PNP0C0C#&lt;instance&gt;#{4afa3d53-74a7-11d0-be5e-00a0c9062857} - GUID_DEVICE_SYS_BUTTON.</summary>
+    public const string InterfacePath =
+        @"\\?\ACPI#PNP0C0C#2&daba3ff&1#{4afa3d53-74a7-11d0-be5e-00a0c9062857}";
+
+    /// <summary>IOCTL_GET_SYS_BUTTON_EVENT = CTL_CODE(FILE_DEVICE_BATTERY 0x29, 0x51, METHOD_BUFFERED, FILE_READ_ACCESS).</summary>
+    public const uint IoctlGetSysButtonEvent = 0x00294144;
+
+    /// <summary>SYS_BUTTON_POWER: the bit the answer carries when the power button was the cause.</summary>
+    public const uint SysButtonPower = 0x00000001;
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern IntPtr CreateFileW(string name, uint access, uint share, IntPtr securityAttributes,
+                                             uint disposition, uint flags, IntPtr template);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool DeviceIoControl(IntPtr handle, uint code, IntPtr inBuffer, uint inSize,
+                                               IntPtr outBuffer, uint outSize, out uint returned, IntPtr overlapped);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CloseHandle(IntPtr handle);
+
+    /// <summary>
+    /// Opens the button device and issues one button-event request. True when the device answered -
+    /// the answer itself is always "no event" from here, which is the point: the driver needs the
+    /// request to exist so it can hook its completion.
+    /// </summary>
+    public static bool Poke(out string detail)
+    {
+        detail = string.Empty;
+
+        IntPtr handle = CreateFileW(InterfacePath, 0x80000000u, 3u, IntPtr.Zero, 3u, 0u, IntPtr.Zero);
+        if (handle == new IntPtr(-1) || handle == IntPtr.Zero)
+        {
+            detail = $"CreateFile failed, err={Marshal.GetLastWin32Error()}";
+            return false;
+        }
+
+        IntPtr buffer = Marshal.AllocHGlobal(8);
+        try
+        {
+            bool ok = DeviceIoControl(handle, IoctlGetSysButtonEvent, IntPtr.Zero, 0, buffer, 4, out uint returned, IntPtr.Zero);
+            int error = Marshal.GetLastWin32Error();
+            uint value = unchecked((uint)Marshal.ReadInt32(buffer));
+
+            detail = ok
+                ? $"ok, returned={returned}, value=0x{value:X8}, err={error}"
+                : $"ioctl failed, err={error}";
+
+            return ok;
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(buffer);
+            CloseHandle(handle);
+        }
+    }
+}
+
+#endregion
+
 #region Power button takeover (RegisterPowerSettingNotification + power scheme APIs)
 
 [StructLayout(LayoutKind.Sequential)]

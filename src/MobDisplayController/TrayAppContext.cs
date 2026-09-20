@@ -361,21 +361,29 @@ public sealed class TrayAppContext : ApplicationContext
                 }
             }
 
-            // The press can only be seen through the standby entry it causes, and that round trip is
-            // what used to end on the sign-in screen. Turning "require a password on wakeup" off is
-            // what removes it: the machine now comes back straight to the desktop.
-            if (_settings.SavedConsoleLockAc is null || _settings.SavedConsoleLockDc is null)
+            // The sign-in prompt only matters on the fallback path, where a press really does enter
+            // standby - that round trip is what used to end on the lock screen. With the filter driver
+            // the button is set to do nothing at all, so the setting is left alone; and if an earlier
+            // version turned it off, this puts the machine back to how it was.
+            if (_powerButtonService.IsDriverBacked)
             {
-                var currentLock = _powerButtonService.ReadConsoleLock();
-                if (currentLock is not null)
-                {
-                    _settings.SavedConsoleLockAc = currentLock.Value.Ac;
-                    _settings.SavedConsoleLockDc = currentLock.Value.Dc;
-                }
+                RestoreConsoleLock();
             }
+            else
+            {
+                if (_settings.SavedConsoleLockAc is null || _settings.SavedConsoleLockDc is null)
+                {
+                    var currentLock = _powerButtonService.ReadConsoleLock();
+                    if (currentLock is not null)
+                    {
+                        _settings.SavedConsoleLockAc = currentLock.Value.Ac;
+                        _settings.SavedConsoleLockDc = currentLock.Value.Dc;
+                    }
+                }
 
-            if (!_powerButtonService.WriteConsoleLock(0, 0, out var lockError))
-                DebugLog.Write($"could not turn off \"require a password on wakeup\": {lockError}");
+                if (!_powerButtonService.WriteConsoleLock(0, 0, out var lockError))
+                    DebugLog.Write($"could not turn off \"require a password on wakeup\": {lockError}");
+            }
 
             if (!_powerButtonService.TryEnable(_settings.SavedPowerButtonActionAc, _settings.SavedPowerButtonActionDc, out var error))
             {

@@ -51,6 +51,17 @@ public sealed class PowerButtonService : IDisposable
     private DateTime _lastPowerEventCheckUtc;
     private long _lastHandledRecordId;
 
+    /// <summary>
+    /// Set when the filter driver (btndrv) is present. The button is then read from the driver's
+    /// named event and the power button itself is left set to "do nothing", so a press has no side
+    /// effects at all. Without the driver the service falls back to sleep-and-read-the-reason.
+    /// </summary>
+    private bool _driverBacked;
+
+    private EventWaitHandle? _driverEvent;
+    private Thread? _driverThread;
+    private ManualResetEvent? _driverStop;
+
     /// <summary>Kernel-Power reason code meaning "this standby entry was caused by the power button".</summary>
     private const int KernelPowerReasonPowerButton = 1;
 
@@ -97,21 +108,25 @@ public sealed class PowerButtonService : IDisposable
     }
 
     /// <summary>
-    /// Points the power button at Windows' native "sleep" action and starts watching for the standby
-    /// entry that names the button as its cause. <paramref name="restoreAc"/>/<paramref name="restoreDc"/>
-    /// are the user's original action, which is put back if the notification can't be registered.
+    /// Points the power button at the action this build actually needs, then starts watching for the
+    /// press. <paramref name="restoreAc"/>/<paramref name="restoreDc"/> are the user's original action,
+    /// which is put back if the notification can't be registered.
     ///
-    /// Sleep rather than "do nothing": with no native action there is nothing left to observe at all
-    /// (measured - with the button set to do nothing, six presses left the event log completely
-    /// empty). Sleep is the only power-button action that reports *why* it happened, and the caller
-    /// keeps the sign-in screen out of the way by turning CONSOLELOCK off while the takeover is armed.
+    /// "Do nothing" when the filter driver is present: the press arrives through the driver's event, so
+    /// the button does not have to cause anything - no sleep, no blank, no sign-in prompt.
+    ///
+    /// "Sleep" when it is not: measured, with the button set to do nothing a press leaves no trace
+    /// anywhere at all, and sleep is the one action whose result states *why* the machine went down.
     /// </summary>
     public bool TryEnable(uint? restoreAc, uint? restoreDc, out string error)
     {
-        if (!TryWriteAction(Power.PBUTTON_SLEEP, Power.PBUTTON_SLEEP, out error))
-            return false;
-
+        // Listening comes first: that is what discovers whether the filter driver is present, and the
+        // answer decides which action the button needs.
         StartListening();
+
+        var action = _driverBacked ? Power.PBUTTON_DO_NOTHING : Power.PBUTTON_SLEEP;
+        if (!TryWriteAction(action, action, out error))
+            return false;
 
         if (_notificationHandle == IntPtr.Zero)
         {
@@ -144,8 +159,8 @@ public sealed class PowerButtonService : IDisposable
         if (_window is not null)
             return;
 
-        // Remember the thread that owns the tray menu: presses are reported by our own polling
-        // thread, which posts them back here so callers can touch the menu directly.
+        // Remember the thread that owns the tray menu: presses are reported by our own threads and
+        // are posted back here, so callers can touch the menu directly.
         _uiContext = SynchronizationContext.Current;
 
         _window = new MessageWindow();
@@ -155,12 +170,25 @@ public sealed class PowerButtonService : IDisposable
         var guid = Power.GUID_CONSOLE_DISPLAY_STATE;
         _notificationHandle = Power.RegisterPowerSettingNotification(_window.Handle, ref guid, Power.DEVICE_NOTIFY_WINDOW_HANDLE);
 
-        StartPowerEventWatcher();
+        // Preferred route: the filter driver reports the press itself, which is what lets the button
+        // be left doing nothing at all. The event log is the fallback when the driver is absent.
+        _driverBacked = TryOpenDriverEvent();
+        if (_driverBacked)
+        {
+            DebugLog.Write("power button: filter driver present - presses come from its named event");
+            StartDriverWatcher();
+        }
+        else
+        {
+            DebugLog.Write("power button: no filter driver - falling back to the Kernel-Power reason");
+            StartPowerEventWatcher();
+        }
     }
 
     public void StopListening()
     {
         StopPowerEventWatcher();
+        StopDriverWatcher();
 
         if (_notificationHandle != IntPtr.Zero)
         {
@@ -324,6 +352,113 @@ public sealed class PowerButtonService : IDisposable
         }
 
         return true;
+    }
+
+    /// <summary>
+    /// True when the button is read through the filter driver rather than through the standby entry's
+    /// reason code. In that mode the button is set to "do nothing" and a press changes nothing about
+    /// the machine's power state, so no sign-in prompt or display blank is involved either.
+    /// </summary>
+    public bool IsDriverBacked => _driverBacked;
+
+    /// <summary>
+    /// Issues one button request and then opens the named event the driver creates.
+    ///
+    /// The request matters: the driver only creates the event while handling that ioctl, and a press
+    /// that has already happened cannot be replayed - so the event has to exist before the user
+    /// presses the button, not after.
+    /// </summary>
+    private bool TryOpenDriverEvent()
+    {
+        try
+        {
+            ButtonDevice.Poke(out var detail);
+            DebugLog.Write($"button device poke: {detail}");
+
+            for (var attempt = 0; attempt < 12; attempt++)
+            {
+                try
+                {
+                    _driverEvent = EventWaitHandle.OpenExisting(@"Global\BtnDrvEvent");
+                    return true;
+                }
+                catch (WaitHandleCannotBeOpenedException)
+                {
+                    Thread.Sleep(150);
+                }
+            }
+
+            DebugLog.Write(@"named event Global\BtnDrvEvent did not appear - driver not installed?");
+            return false;
+        }
+        catch (Exception ex)
+        {
+            DebugLog.Write($"driver event unavailable: {ex.Message}");
+            return false;
+        }
+    }
+
+    private void StartDriverWatcher()
+    {
+        if (_driverThread is not null || _driverEvent is null)
+            return;
+
+        _driverStop = new ManualResetEvent(false);
+        _driverThread = new Thread(DriverEventLoop)
+        {
+            IsBackground = true,
+            Name = "power-button-driver",
+        };
+        _driverThread.Start();
+        DebugLog.Write(@"driver watcher started: waiting on Global\BtnDrvEvent");
+    }
+
+    private void StopDriverWatcher()
+    {
+        _driverStop?.Set();
+        _driverThread = null;
+        _driverStop = null;
+
+        _driverEvent?.Dispose();
+        _driverEvent = null;
+    }
+
+    /// <summary>
+    /// Waits on the driver's manual-reset event and resets it after each press. The driver signals it
+    /// from the completion of the system's own button request, so the press arrives without the
+    /// machine having had to do anything about it.
+    /// </summary>
+    private void DriverEventLoop()
+    {
+        while (!_driverStop!.WaitOne(0))
+        {
+            try
+            {
+                if (_driverEvent is null || !_driverEvent.WaitOne(500))
+                    continue;
+
+                _driverEvent.Reset();
+
+                if (DateTime.UtcNow - _lastAcceptedPress < PressDebounce)
+                {
+                    DebugLog.Write("driver press debounced");
+                    continue;
+                }
+
+                _lastAcceptedPress = DateTime.UtcNow;
+                DebugLog.Write("power button press: reported by the filter driver (no standby involved)");
+
+                if (_uiContext is not null)
+                    _uiContext.Post(_ => PowerButtonPressed?.Invoke(), null);
+                else
+                    PowerButtonPressed?.Invoke();
+            }
+            catch (Exception ex)
+            {
+                DebugLog.Write($"driver watcher failed: {ex.Message}");
+                return;
+            }
+        }
     }
 
     private void StartPowerEventWatcher()
