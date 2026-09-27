@@ -9,6 +9,16 @@ internal static class Program
     [STAThread]
     private static void Main(string[] args)
     {
+        // A way to run the Start-menu hook installation without the tray, for testing it from a script: the
+        // same call the menu's entry makes, so what is verified here is what the menu does. It runs before
+        // the single-instance check, because it has nothing to do with the running instance.
+        if (args.Length > 0 && args[0].Equals("--inject-start-menu-hook", StringComparison.OrdinalIgnoreCase))
+        {
+            var attached = StartMenuHookInstaller.Attach(out var report);
+            DebugLog.Write($"start menu hook (command line): ok={attached} {report}");
+            return;
+        }
+
         using var mutex = new Mutex(initiallyOwned: true, MutexName, out bool createdNew);
 
         if (!createdNew)

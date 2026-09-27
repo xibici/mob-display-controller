@@ -31,6 +31,49 @@ public sealed class AppSettings
     /// <summary>Same as <see cref="SavedConsoleLockAc"/> but for DC (on battery).</summary>
     public uint? SavedConsoleLockDc { get; set; }
 
+    /// <summary>
+    /// The tray menu's own behaviour, all of it visible under "托盘菜单" in that menu.
+    ///
+    /// These were constants while the menu's placement was being worked out, because each one is a guess
+    /// about the shell that the answers on the screen disagree with from machine to machine: whether the
+    /// taskbar covers the menu's last items, and how long the Start menu takes to get out of the way. They
+    /// are settings now so the answers can be tried without a rebuild.
+    /// </summary>
+    public bool MenuAvoidTaskbar { get; set; } = true;
+
+    /// <summary>Pixels of daylight kept between the menu and the taskbar. One is enough to be visible; more
+    /// is only useful on a scaled display where the taskbar's own rect is reported in physical pixels.</summary>
+    public int MenuTaskbarGap { get; set; } = 1;
+
+    /// <summary>
+    /// Whether a request for the menu is held back while the shell has the Start menu, Search or the Action Center
+    /// on screen.
+    ///
+    /// It has to be: those panels keep the activation, and a WinForms drop-down closes itself as soon as it loses
+    /// the activation - measured, 40 ms after it was shown, so the menu flashed and no entry could be clicked.
+    /// Turning AutoClose off to stop that made the menu impossible to dismiss at all (WinForms' own close path
+    /// stops working), so the panel is waited for instead.
+    /// </summary>
+    public bool MenuDeferWhileShellPanel { get; set; } = true;
+
+    /// <summary>
+    /// How long a request for the menu waits for the shell's panel to go, in milliseconds. A time rather than a
+    /// number of tries because the panel's window keeps answering hit-tests for a second or two after the panel
+    /// has been dismissed (it stays while it animates away).
+    /// </summary>
+    public int MenuPanelWaitMs { get; set; } = 3000;
+
+    /// <summary>
+    /// How long a shell panel still counts as "just here" after it has handed the foreground back. It hands
+    /// it back as soon as the click that dismisses it is processed - which is when the menu is asked for -
+    /// and it stays on screen for the rest of its close animation.
+    /// </summary>
+    public int MenuShellPanelGraceMs { get; set; } = 120;
+
+    /// <summary>Whether the menu is re-raised on a timer while it is open, because the taskbar and the icon
+    /// flyout take their topmost place back after the menu has been shown.</summary>
+    public bool MenuKeepTopMost { get; set; } = true;
+
     private static string SettingsPath
     {
         get

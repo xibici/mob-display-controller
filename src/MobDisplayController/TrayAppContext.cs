@@ -1,4 +1,6 @@
 using Microsoft.Win32;
+using System.ComponentModel;
+using System.Diagnostics;
 using MobDisplayController.Models;
 using MobDisplayController.Native;
 using MobDisplayController.Services;
@@ -13,7 +15,7 @@ namespace MobDisplayController;
 public sealed class TrayAppContext : ApplicationContext
 {
     private readonly NotifyIcon _trayIcon;
-    private readonly ContextMenuStrip _menu = new();
+    private readonly TopMostMenu _menu = new();
     private readonly DisplayService _displayService = new();
     private readonly MonitorControlService _monitorControlService = new();
     private readonly StartupService _startupService = new();
@@ -38,10 +40,126 @@ public sealed class TrayAppContext : ApplicationContext
     private ToolStripMenuItem _startupMenuItem = new();
     private ToolStripMenuItem _powerButtonTakeoverMenuItem = new();
 
+    private ToolStripMenuItem _startMenuSizeMenuItem = new();
+    private ToolStripMenuItem _trayMenuMenuItem = new();
+    private ToolStripMenuItem _advancedMenuItem = new();
+
     private SettingsForm? _settingsForm;
+
+    /// <summary>
+    /// Re-raises the menu while it is open - see WindowZOrder - because the taskbar raises itself
+    /// again after the menu has been shown.
+    /// </summary>
+    private readonly System.Windows.Forms.Timer _menuOnTopTimer = new() { Interval = 200 };
+
+    /// <summary>Comes back for the menu once the shell's panel is gone (see OnMenuOpening).</summary>
+    private readonly System.Windows.Forms.Timer _menuRetryTimer = new() { Interval = 60 };
+
+    /// <summary>When the current request for the menu stops waiting for the shell's panel.</summary>
+    private long _panelWaitDeadline;
+
+    /// <summary>Where the pointer was when the menu was asked for, so it can be opened there afterwards.</summary>
+    private Point _menuAnchor;
+
+    /// <summary>Set while this app has dismissed the shell's panel for the request that is in flight.</summary>
+    private bool _panelDismissed;
+
+    /// <summary>
+    /// How many times the dismissal is retried for one request. One Escape can be sent while the panel is still
+    /// animating in, in which case it lands on nothing.
+    /// </summary>
+    private int _panelDismissTries;
+
+    /// <summary>
+    /// How many times the panel is asked to go away while the menu waits for it.
+    ///
+    /// Two, not six: the first attempt is the one that dismisses it, and each later attempt hands the panel the
+    /// foreground again through TakeForeground - which re-activates the very window the wait is trying to get rid
+    /// of. Measured 2026-09-26 09:42-09:43: requests that found a panel took 1.0-1.4 s, seven of them spent in
+    /// "focus and Escape sent to StartMenuExperienceHost". After the first Escape the useful thing is to watch, not
+    /// to keep prodding.
+    /// </summary>
+    private const int MaxPanelDismissTries = 2;
+
+    /// <summary>
+    /// The menu is re-shown when the shell closed it again almost immediately.
+    ///
+    /// That is what the sticky state looks like: the shell's panel (or a shell window that outlives it) keeps the
+    /// foreground, and a WinForms drop-down loses the activation and closes itself - measured 8 ms after it had
+    /// been shown, which the user sees as "the menu cannot be summoned at all". The state usually clears within a
+    /// moment, so a retry or two turns that into a menu that opens.
+    /// </summary>
+    private int _instantCloseRetries;
+
+    /// <summary>
+    /// How many times a menu the shell dropped may be shown again, and how long to wait before each attempt.
+    ///
+    /// Eight at 250 ms rather than three at 450 ms, because how often the shell wins varies from attempt to
+    /// attempt: measured 2026-09-26 09:27:55, the menu was closed 16 ms after it opened, and then closed again
+    /// 593 ms after the retry - which with a 500 ms cut-off was the last attempt, so the user saw nothing. That is
+    /// their "sometimes it works, sometimes it does not".
+    /// </summary>
+    private const int MaxInstantCloseRetries = 8;
+
+    private const int RetryDelayMs = 250;
+
+    /// <summary>When the menu was last shown, to tell "closed at once" from a normal close.</summary>
+    private long _menuOpenedTick;
+
+    private readonly System.Windows.Forms.Timer _reopenTimer = new() { Interval = 450 };
+
+    /// <summary>Why the pending re-show is happening - carried into the log when it fires.</summary>
+    private string _pendingShowReason = "after the shell dropped it";
+
+    /// <summary>
+    /// Set while this app shows the menu itself (ShowMenuByHand), so the Opening handler does not cancel its own
+    /// show. That is not a detail: Show() raises Opening again, so without this the two would argue - Opening
+    /// cancelled the show, the retry called Show() again, and a Show() that was cancelled part-way leaves the
+    /// drop-down in a state WinForms still counts as open. From then on every click on the tray icon did nothing
+    /// at all (no Opening, no menu, no log), which is what the log showed on 2026-09-26 at 08:45:45.
+    /// </summary>
+    private bool _showingByHand;
+
+    /// <summary>
+    /// Watches the foreground, so that a panel which was up when the tray icon was clicked is still known
+    /// a moment later, when the panel itself is no longer the foreground window.
+    /// </summary>
+    private readonly System.Windows.Forms.Timer _shellWatchTimer = new() { Interval = 250 };
+
+    /// <summary>
+    /// Whether a shell panel window was over the screen the last time the watch looked, so only the changes are
+    /// logged. Cloaked windows are counted here (see ShellPanels.TryFindAnyShellPanel), which is the point: it says
+    /// whether what is stacked over the screen is being drawn or is a leftover from earlier.
+    /// </summary>
+    private bool _shellPanelWasThere;
+
+    private long _lastShellPanelTick;
+
+    /// <summary>
+    /// Checks, every ten seconds and off the UI thread, that the shell still knows the tray icon.
+    ///
+    /// The icon can be drawn while the notification area has stopped routing clicks to it - after a fullscreen
+    /// application released the screen, on this machine on 2026-09-26 - and that looks exactly like "clicking
+    /// the icon does nothing". Asking the shell where the icon is (Shell_NotifyIconGetRect) is a direct answer,
+    /// and re-adding the icon is the fix. The check runs on a background thread because it is a round trip to
+    /// the shell: a hung shell must not be able to block the thread that owns the menu.
+    /// </summary>
+    private readonly System.Threading.Timer _iconHealthTimer = new(OnIconHealthCheckStatic, null, 10000, 10000);
+
+    private static TrayAppContext? s_current;
+
+    private bool _iconWasRegistered = true;
+
+    private int _iconLossesInARow;
+
+    private long _lastIconReregisterTick;
+
+    private HotkeyWindow? _menuHotkey;
 
     public TrayAppContext()
     {
+        s_current = this;
+
         _trayIcon = new NotifyIcon
         {
             Icon = TrayIcons.Default,
@@ -52,10 +170,71 @@ public sealed class TrayAppContext : ApplicationContext
 
         _trayIcon.DoubleClick += (_, _) => OpenSettings();
 
+        // These are logged, all of them: "I right-clicked the icon and nothing happened" cannot be told apart
+        // from "the shell never delivered the click" without it, and that was the shape of the report on
+        // 2026-09-26 (after running a game and coming back to the desktop). With the log, the next occurrence
+        // says which half of the path is broken.
+        _trayIcon.MouseDown += (_, e) => DebugLog.Write($"tray icon: mouse down ({e.Button} at {e.X},{e.Y})");
+        _trayIcon.MouseUp += (_, e) => DebugLog.Write($"tray icon: mouse up ({e.Button} at {e.X},{e.Y})");
+
         BuildStaticMenuItems();
         RefreshMenu();
 
-        SystemEvents.DisplaySettingsChanged += (_, _) => RefreshMenuSafe();
+        // Everything about this menu is shaped by one fact: the pointer is on the taskbar when it is
+        // opened. So (a) it must not open while the shell has a panel of its own up, because those are
+        // drawn above a foreign topmost window (OnMenuOpening); (b) WinForms deliberately places it
+        // over the taskbar, so it is moved clear of it (KeepMenuOffTaskbar); and (c) the taskbar and the
+        // icon flyout take their topmost place back after the fact, so it is raised again and again
+        // (TopMostMenu and _menuOnTopTimer).
+        _menu.Opening += OnMenuOpening;
+        _menu.Opened += (_, _) => OnMenuOpened();
+        _menu.Closed += (_, e) =>
+        {
+            var openFor = Environment.TickCount64 - _menuOpenedTick;
+            DebugLog.Write($"tray menu: closed ({e.CloseReason}) after {openFor} ms");
+            _menuOnTopTimer.Stop();
+            MouseWatcher.Stop();
+
+            // Retry when the shell is the one closing it. "A shell window holds the foreground" alone is not enough:
+            // taking the foreground is exactly what ShowMenuByHand does, so at close time the foreground is usually
+            // this app instead (measured 09:32:04: closed after 0 ms, and no retry at all because of that test). A
+            // close within a moment of opening is the shell either way - a person needs longer than that to click
+            // anything, so a real dismissal (the user picking another app) cannot be mistaken for this.
+            if (e.CloseReason == ToolStripDropDownCloseReason.AppFocusChange
+                && (openFor < 1500 || ShellPanels.IsForeground())
+                && _instantCloseRetries < MaxInstantCloseRetries)
+            {
+                _instantCloseRetries++;
+                DebugLog.Write($"tray menu: the shell dropped it again after {openFor} ms - showing it again ({_instantCloseRetries}/{MaxInstantCloseRetries})");
+                ShowMenuByHandSoon(RetryDelayMs, "after the shell dropped it");
+                return;
+            }
+
+            _instantCloseRetries = 0;
+        };
+        _menuOnTopTimer.Tick += (_, _) => OnMenuTick();
+        _menuRetryTimer.Tick += (_, _) => OnMenuRetry();
+        MouseWatcher.ButtonDown += OnAnyButtonDown;
+
+        _reopenTimer.Tick += (_, _) =>
+        {
+            _reopenTimer.Stop();
+            ShowMenuByHand(Cursor.Position, _pendingShowReason);
+        };
+
+        _shellWatchTimer.Tick += (_, _) => OnShellWatch();
+        _shellWatchTimer.Start();
+
+        SystemEvents.DisplaySettingsChanged += (_, _) =>
+        {
+            RefreshMenuSafe();
+
+            // A display mode switch is what a game does on the way in and out, and it is the moment the
+            // notification area was seen to drop its idea of where our icon is. Re-adding the icon here costs
+            // a flicker and removes the wait for OnIconHealthCheck.
+            DebugLog.Write("display settings changed - re-adding the tray icon");
+            ReRegisterTrayIcon();
+        };
 
         // Reconcile the on-disk autostart preference with what's actually in the registry.
         _startupService.SetEnabled(_settings.StartWithWindows);
@@ -79,6 +258,14 @@ public sealed class TrayAppContext : ApplicationContext
         _layoutHotkey.Pressed += OnLayoutHotkey;
         if (!_layoutHotkey.IsRegistered)
             DebugLog.Write("layout hotkey Ctrl+Alt+Shift+L is already taken - no keyboard layout switch");
+
+        // Ctrl+Alt+Shift+M opens the same menu from the keyboard. It exists for the one thing the tray icon
+        // cannot cover: an icon the notification area has stopped answering for. It also tells the two apart -
+        // if this works while the icon does not, the app is fine and the shell is not.
+        _menuHotkey = new HotkeyWindow(Hotkeys.MOD_CONTROL | Hotkeys.MOD_ALT | Hotkeys.MOD_SHIFT, (uint)Keys.M);
+        _menuHotkey.Pressed += OnMenuHotkey;
+        if (!_menuHotkey.IsRegistered)
+            DebugLog.Write("menu hotkey Ctrl+Alt+Shift+M is already taken - no keyboard way to the menu");
 
         // Reconcile the on-disk preference with the actual power scheme setting, the same way
         // autostart is reconciled above - re-applying "do nothing" is idempotent and guards
@@ -123,7 +310,7 @@ public sealed class TrayAppContext : ApplicationContext
             _settings.Save();
         };
 
-        _powerButtonTakeoverMenuItem.Text = "接管电源键(按一下在两种显示模式间切换)";
+        _powerButtonTakeoverMenuItem.Text = "接管电源键";
         _powerButtonTakeoverMenuItem.CheckOnClick = true;
         _powerButtonTakeoverMenuItem.Checked = _settings.PowerButtonTakeoverEnabled;
         _powerButtonTakeoverMenuItem.Click += (_, _) => ApplyPowerButtonTakeover(_powerButtonTakeoverMenuItem.Checked);
@@ -136,6 +323,16 @@ public sealed class TrayAppContext : ApplicationContext
 
         _displayModeMenuItem.Text = "显示模式";
 
+        // Named here rather than only inside their builders: those bail out early when no matching monitor
+        // is connected, and the three rows then came up blank.
+        _rotationMenuItem.Text = "旋转";
+        _brightnessMenuItem.Text = "亮度";
+        _volumeMenuItem.Text = "音量";
+
+        _startMenuSizeMenuItem.Text = "开始菜单尺寸";
+        _trayMenuMenuItem.Text = "托盘菜单";
+        _advancedMenuItem.Text = "高级";
+
         _menu.Items.Add(_statusItem);
         _menu.Items.Add(new ToolStripSeparator());
         _menu.Items.Add(_connectToggleItem);
@@ -144,14 +341,485 @@ public sealed class TrayAppContext : ApplicationContext
         _menu.Items.Add(_brightnessMenuItem);
         _menu.Items.Add(_volumeMenuItem);
         _menu.Items.Add(new ToolStripSeparator());
+        _menu.Items.Add(_startMenuSizeMenuItem);
+        _menu.Items.Add(_trayMenuMenuItem);
+        _menu.Items.Add(new ToolStripSeparator());
         _menu.Items.Add(settingsItem);
         _menu.Items.Add(_startupMenuItem);
         _menu.Items.Add(_powerButtonTakeoverMenuItem);
+        _menu.Items.Add(_advancedMenuItem);
         _menu.Items.Add(refreshItem);
         _menu.Items.Add(new ToolStripSeparator());
         _menu.Items.Add(exitItem);
+    }
 
-        _menu.Opening += (_, _) => RefreshMenu();
+    /// <summary>
+    /// Holds the menu back while the shell has one of its own panels up, and puts that panel away so the menu can
+    /// open in its place.
+    ///
+    /// Those panels keep the activation, and a WinForms drop-down closes itself as soon as it loses it: measured,
+    /// with the Start menu up the menu was gone 40 ms after it was shown, so every click belonged to the panel and
+    /// no entry could be used. Turning AutoClose off to prevent that made the menu impossible to dismiss instead -
+    /// WinForms' own close path stops working - so the panel is waited for.
+    ///
+    /// The show that follows is this app's own (ShowMenuByHand) and is guarded by _showingByHand, because Show()
+    /// raises Opening again: without that guard the deferral cancelled its own show, and a cancelled show left the
+    /// drop-down in a state WinForms counted as open, after which the tray icon did nothing at all.
+    /// </summary>
+    private void OnMenuOpening(object? sender, CancelEventArgs e)
+    {
+        RefreshMenu();
+
+        if (_showingByHand)
+            return;
+
+        if (!_settings.MenuDeferWhileShellPanel || !IsShellPanelInTheWay())
+        {
+            _panelDismissed = false;
+            _panelDismissTries = 0;
+
+            // A shell window that keeps the foreground after its panel has gone (measured: StartMenuExperienceHost
+            // does so for seconds) is not something to wait for - waiting is what made the menu look dead for three
+            // seconds. It does steal the activation from a drop-down shown the normal way, though, so show the menu
+            // by hand instead: that takes the foreground first.
+            if (ShellPanels.IsForeground())
+            {
+                e.Cancel = true;
+                _menuAnchor = Cursor.Position;
+                ShowMenuByHandSoon(1, "a shell window still had the foreground");
+                return;
+            }
+
+            return;
+        }
+
+        e.Cancel = true;
+
+        // An in-flight wait is not extended by further clicks: the user clicking again is impatience, not a new
+        // situation, and resetting the deadline here meant the menu could be held back indefinitely.
+        if (!_panelDismissed)
+        {
+            _panelDismissed = true;
+            _menuAnchor = Cursor.Position;
+            _panelWaitDeadline = Environment.TickCount64 + Math.Max(_settings.MenuPanelWaitMs, 500);
+            DebugLog.Write($"tray menu: a shell panel is in the way, waiting up to {_settings.MenuPanelWaitMs} ms - {ShellPanels.DescribeOnScreen()}");
+            TryDismissShellPanel(takeForeground: true);
+        }
+
+        _menuRetryTimer.Start();
+    }
+
+    /// <summary>
+    /// True while one of the shell's panels is really on screen, or was a moment ago.
+    ///
+    /// "On screen" is checked by hit-testing a few points (ShellPanels.IsOnScreen) because it is the only signal
+    /// that reflects the panel itself: the foreground can be a *different* shell window while the Start menu is up
+    /// (measured: foreground SearchHost, panel StartMenuExperienceHost), so a foreground-only test both misses the
+    /// panel and, worse, aims the dismissal at the wrong window.
+    ///
+    /// Deliberately NOT "the foreground window is a shell window": measured, StartMenuExperienceHost keeps the
+    /// foreground for seconds after the Start menu has closed, and waiting for that cost a three-second stall on
+    /// every right-click - which is what "the menu cannot be summoned" looked like. A stale foreground is dealt
+    /// with by showing the menu by hand instead (see OnMenuOpening).
+    /// </summary>
+    private bool IsShellPanelInTheWay() => ShellPanels.IsOnScreen() || ShellPanelSeenRecently();
+
+    /// <summary>
+    /// Puts the shell's panel away with the Escape key the shell uses for that - never with a click, because a
+    /// click while the Start menu is up is passed on to whatever window is underneath (measured), which on a game
+    /// is its fire button.
+    ///
+    /// The Escape goes to the *panel's own window*, which is found by hit-testing: sending it to whatever has the
+    /// foreground is what failed in the user's log (2026-09-26 09:18) - the foreground was SearchHost while the
+    /// Start menu belonged to StartMenuExperienceHost, so the key went to the wrong shell window and the panel
+    /// stayed up through every retry. The panel is given the focus first so that the key cannot land anywhere else.
+    /// </summary>
+    /// <param name="takeForeground">
+    /// Whether to give the panel the focus before sending the key. True for the first attempt only: doing it again
+    /// returns the activation to the panel and keeps it alive (see MaxPanelDismissTries).
+    /// </param>
+    private bool TryDismissShellPanel(bool takeForeground)
+    {
+        if (ShellPanels.TryFindOnScreenPanel(out var panel, out var host) && panel != IntPtr.Zero)
+        {
+            if (takeForeground)
+                WindowZOrder.TakeForeground(panel);
+
+            Input.SendEscape();
+            DebugLog.Write(takeForeground
+                ? $"tray menu: focus and Escape sent to {host}"
+                : $"tray menu: Escape sent to {host} again, without taking the focus");
+            return true;
+        }
+
+        if (ShellPanels.IsForeground())
+        {
+            Input.SendEscape();
+            DebugLog.Write("tray menu: Escape sent to the panel that has the focus");
+            return true;
+        }
+
+        DebugLog.Write("tray menu: a shell panel is in the way but could not be found to dismiss");
+        return false;
+    }
+
+    /// <summary>
+    /// True while a shell panel is in the foreground, and for a moment after it has gone: the panel hands the
+    /// foreground back as soon as the click that dismisses it has been processed - which is exactly when this app
+    /// is told to open its menu - and it stays on screen for the rest of its close animation.
+    /// </summary>
+    private bool ShellPanelSeenRecently()
+        => Environment.TickCount64 - _lastShellPanelTick < _settings.MenuShellPanelGraceMs;
+
+    /// <summary>
+    /// Opens the menu by hand once the shell's panel is off the screen, because the NotifyIcon path only runs on the
+    /// click that asked for it.
+    /// </summary>
+    private void OnMenuRetry()
+    {
+        _menuRetryTimer.Stop();
+
+        if (IsShellPanelInTheWay())
+        {
+            if (_panelDismissTries < MaxPanelDismissTries)
+            {
+                _panelDismissTries++;
+                TryDismissShellPanel(takeForeground: _panelDismissTries == 1);
+            }
+
+            if (Environment.TickCount64 < _panelWaitDeadline)
+            {
+                _menuRetryTimer.Start();
+                return;
+            }
+
+            // The wait is over and something still looks like a panel. Open the menu anyway: a menu that may not be
+            // clickable is better than no menu at all if that reading is wrong, and the log says what happened.
+            // The description is repeated here on purpose - "what did it see for those three seconds, and did that
+            // change?" is the question this line exists to answer.
+            DebugLog.Write($"tray menu: something still looked like a shell panel after {_settings.MenuPanelWaitMs} ms - opening anyway - {ShellPanels.DescribeOnScreen()}");
+        }
+
+        _panelDismissTries = 0;
+
+        // Only where the user asked for it: anywhere else the menu would appear away from the icon. The tolerance is
+        // 80 px rather than 12 because a finger on a touchscreen does not move the cursor the way a mouse does -
+        // measured, the cursor read 1296,1166 at one request and 1296,1178 at the next, and with a 12 px window the
+        // show was refused *silently*: the log had "opening anyway" and then nothing, which is the user seeing
+        // nothing happen at all. If it ever declines again, it says so.
+        if (_panelDismissed)
+        {
+            var drift = Math.Abs(Cursor.Position.X - _menuAnchor.X) + Math.Abs(Cursor.Position.Y - _menuAnchor.Y);
+            if (drift < 80)
+                ShowMenuByHand(_menuAnchor, "after the shell panel went");
+            else
+                DebugLog.Write($"tray menu: not opening - the pointer moved {drift} px from where the menu was asked for ({_menuAnchor.X},{_menuAnchor.Y})");
+        }
+
+        _panelDismissed = false;
+    }
+
+    /// <summary>
+    /// Keeps an eye on the shell's panels while the menu is up: a panel that takes the screen takes it for
+    /// good, because it is drawn above a foreign topmost window (measured), and every click is its dismissal -
+    /// so the menu is closed instead of being left there looking usable.
+    ///
+    /// The test is "on screen", not "in the foreground": a panel that is still opening is already hit-testable
+    /// while the foreground has not moved to it yet, and that is the state a menu must not be left in.
+    /// </summary>
+    private void OnShellWatch()
+    {
+        // Self-heal first, whatever else is on screen: a drop-down WinForms believes is open is never shown
+        // again, so if the window behind it is gone the tray icon goes dead - every later click is ignored and
+        // nothing is logged, because Opening is not raised again. Clearing the state is what makes the icon work.
+        if (_menu.Visible && !WindowZOrder.IsReallyVisible(_menu.Handle))
+        {
+            DebugLog.Write("tray menu: it counted as open with no window behind it - clearing it");
+            _menu.Close(ToolStripDropDownCloseReason.AppFocusChange);
+        }
+
+        // Record whether a shell panel window is stacked over the screen, and log the *changes* only - without
+        // anyone asking for the menu. The state the user reports as "sometimes it just does not open" comes and goes
+        // while they are doing something else entirely (a game, a swipe up from the bottom), so catching it in the
+        // act is the only honest way to diagnose it. Cloaked windows count here (see
+        // ShellPanels.TryFindAnyShellPanel) and the line carries what the presence test sees, so a leftover shell
+        // window cannot hide behind a fix that silently ignores it.
+        var shellPanelThere = ShellPanels.TryFindAnyShellPanel(out _, out _);
+        if (shellPanelThere != _shellPanelWasThere)
+        {
+            _shellPanelWasThere = shellPanelThere;
+            DebugLog.Write($"shell panel window {(shellPanelThere ? "is over the screen" : "is gone")} - {ShellPanels.DescribeOnScreen()}");
+        }
+
+        if (!ShellPanels.IsForeground())
+            return;
+
+        _lastShellPanelTick = Environment.TickCount64;
+
+        // The menu is deliberately *not* closed here any more. It stays usable while a panel is up - that is what
+        // AutoClose = false and the mouse capture are for - and closing it whenever a panel held the foreground
+        // was what made it disappear the moment it appeared.
+    }
+
+    /// <summary>
+    /// Opens the menu by hand once the shell's panel is off the screen, because the NotifyIcon path only runs
+    /// on the click that asked for it. A drop-down opened this way is not dismissed by a click outside it, so
+    /// it is given the mouse capture: TopMostMenu then sees every click and closes on the ones outside.
+    /// </summary>
+    private void OnMenuOpened()
+    {
+        _menuOpenedTick = Environment.TickCount64;
+        DebugLog.Write($"tray menu: opened ({_menu.Items.Count} items at {_menu.Bounds.X},{_menu.Bounds.Y})");
+        KeepMenuOffTaskbar();
+
+        // No SetCapture here: a drop-down that holds the mouse capture refuses to hide, so every attempt to close
+        // the menu (an entry being used, a click outside) silently did nothing and the menu could never be got rid
+        // of. What keeps the menu alive while the shell's panel holds the activation is AutoClose = false alone.
+        MouseWatcher.Start();
+
+        _menuOnTopTimer.Start();
+    }
+
+    /// <summary>
+    /// Shows the menu without a click on the tray icon - the two paths that need it are OnMenuRetry (after the
+    /// shell's own panel was dismissed for the request) and the keyboard shortcut.
+    ///
+    /// The app has to be the foreground process first, which is what the shell's own path does for us
+    /// (NotifyIcon calls SetForegroundWindow before showing the menu). Without it a drop-down closes itself the
+    /// moment it opens: measured, "opened by hand" followed three milliseconds later by "closed
+    /// (AppFocusChange)", which is indistinguishable from "the shortcut did nothing".
+    ///
+    /// A drop-down opened this way gets no click-outside handling from WinForms either, because it never held
+    /// the capture and the click does not reach it, so the mouse hook takes that over (see MouseWatcher).
+    /// </summary>
+    /// <summary>
+    /// Shows the menu a moment from now, after the current message has been handled.
+    ///
+    /// Show() cannot be called from inside the Opening handler: Opening would run again, find a shell panel, cancel
+    /// the show, and leave the drop-down in the half-open state that made every later click do nothing (see
+    /// _showingByHand).
+    /// </summary>
+    private void ShowMenuByHandSoon(int delayMs, string why)
+    {
+        _pendingShowReason = why;
+        _reopenTimer.Interval = delayMs;
+        _reopenTimer.Start();
+    }
+
+    private void ShowMenuByHand(Point anchor, string why)
+    {
+        MakeThisAppForeground();
+
+        RefreshMenu();
+
+        // A drop-down WinForms counts as open is never shown again, so any leftover state is cleared first.
+        if (_menu.Visible && !WindowZOrder.IsReallyVisible(_menu.Handle))
+        {
+            DebugLog.Write("tray menu: it counted as open with no window behind it - clearing that first");
+            _menu.Close(ToolStripDropDownCloseReason.AppFocusChange);
+        }
+
+        _showingByHand = true;
+        try
+        {
+            _menu.Show(anchor, ToolStripDropDownDirection.AboveLeft);
+        }
+        finally
+        {
+            _showingByHand = false;
+        }
+
+        DebugLog.Write($"tray menu: opened by hand at {anchor.X},{anchor.Y} ({why})");
+    }
+
+    /// <summary>
+    /// Asks for the foreground with the window the tray icon already owns.
+    ///
+    /// Any window of this process would do, and that one is already to hand (NotifyIcons finds it). A request
+    /// that Windows refuses is harmless: the drop-down then behaves as it did before, closing itself.
+    /// </summary>
+    private static void MakeThisAppForeground()
+    {
+        var icon = NotifyIcons.TryGetIconRect(out var window);
+        if (icon is not null && window != IntPtr.Zero)
+            WindowZOrder.TakeForeground(window);
+    }
+
+    private void OnMenuHotkey()
+    {
+        if (_menu.Visible)
+        {
+            _menu.Close();
+            return;
+        }
+
+        ShowMenuByHand(Cursor.Position, "hotkey Ctrl+Alt+Shift+M");
+    }
+
+    /// <summary>
+    /// Puts the icon back into the notification area. NotifyIcon does not expose its message window, so this is
+    /// the visible/invisible pair the type offers: that is a Shell_NotifyIcon delete followed by an add, which
+    /// is what the shell needs to start answering for it again.
+    /// </summary>
+    private void ReRegisterTrayIcon()
+    {
+        if (_uiDispatcher.InvokeRequired)
+        {
+            try { _uiDispatcher.BeginInvoke(new Action(ReRegisterTrayIcon)); } catch { }
+            return;
+        }
+
+        try
+        {
+            _trayIcon.Visible = false;
+            _trayIcon.Visible = true;
+            _lastIconReregisterTick = Environment.TickCount64;
+        }
+        catch (Exception ex)
+        {
+            DebugLog.Write($"tray icon: could not be re-added: {ex.Message}");
+        }
+    }
+
+    /// <summary>Background half of the icon check - see _iconHealthTimer.</summary>
+    private static void OnIconHealthCheckStatic(object? state)
+        => s_current?.CheckIconHealth();
+
+    private void CheckIconHealth()
+    {
+        var rect = NotifyIcons.TryGetIconRect(out _);
+
+        if (rect is not null)
+        {
+            if (!_iconWasRegistered)
+                DebugLog.Write($"tray icon: the shell has the icon again (at {rect.Value.X},{rect.Value.Y})");
+
+            _iconWasRegistered = true;
+            _iconLossesInARow = 0;
+            return;
+        }
+
+        _iconLossesInARow++;
+
+        // Two misses in a row, and never more often than once a minute: a re-add costs an icon flicker, and
+        // the shell can answer "no" for a moment while it is moving the icon about.
+        if (_iconLossesInARow < 2 || Environment.TickCount64 - _lastIconReregisterTick < 60000)
+            return;
+
+        DebugLog.Write("tray icon: the shell does not know the icon - clicks on it would do nothing; re-adding it");
+        _iconWasRegistered = false;
+        _iconLossesInARow = 0;
+        ReRegisterTrayIcon();
+    }
+
+    /// <summary>
+    /// Keeps the menu raised, and dismisses it on a click outside.
+    ///
+    /// The raising is needed because the taskbar and the icon flyout take their topmost place back after
+    /// the menu has been shown (see TopMostMenu). The dismissal is needed for the menus this app opens by
+    /// hand - after dismissing a shell panel (see OnMenuRetry): those do not get WinForms' click-outside
+    /// handling, because without the mouse capture they never see the click.
+    /// </summary>
+    private void OnMenuTick()
+    {
+        if (_settings.MenuKeepTopMost)
+            WindowZOrder.RaiseToTopMost(_menu.Handle);
+
+        // The menu's bounds are read here rather than remembered from show time: KeepMenuOffTaskbar moves the
+        // menu after it appears, so an honest test has to use where it is now.
+        if (MouseWatcher.TakeClick(out var click, out _, out var fromTouch))
+        {
+            var inside = _menu.Bounds.Contains(click);
+
+            // A click inside the menu is an entry being used - WinForms closes the drop-down itself in that case
+            // (AutoClose is on), so only the click outside is acted on here.
+            if (!inside)
+            {
+                DebugLog.Write($"tray menu: click at {click.X},{click.Y}{(fromTouch ? " (touch)" : string.Empty)} was outside {_menu.Bounds} - closing");
+                _menu.Close(ToolStripDropDownCloseReason.AppClicked);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Closes the menu the moment the user presses anywhere outside it.
+    ///
+    /// This is here and not only in the 200 ms watch (OnMenuTick) because the user's words are "pressing anywhere
+    /// else should close it at once", and the watch could leave the menu up for up to a fifth of a second after the
+    /// press. The close is *posted* rather than done here: this runs inside the hook callback, and closing a window
+    /// runs WinForms' message pumping - and a hook callback that throws is removed by Windows, after which nothing
+    /// closes the menu at all.
+    /// </summary>
+    private void OnAnyButtonDown(Point point, bool leftButton, bool fromTouch)
+    {
+        if (!_menu.Visible || !MouseWatcher.IsWatching)
+            return;
+
+        try
+        {
+            _menu.BeginInvoke(() =>
+            {
+                if (!_menu.Visible || _menu.Bounds.Contains(point))
+                    return;
+
+                DebugLog.Write($"tray menu: press at {point.X},{point.Y}{(fromTouch ? " (touch)" : string.Empty)} was outside {_menu.Bounds} - closing at once");
+                _menu.Close(ToolStripDropDownCloseReason.AppClicked);
+            });
+        }
+        catch (InvalidOperationException)
+        {
+            // The menu's handle went away between the check and the post - nothing to close.
+        }
+    }
+
+    /// <summary>
+    /// Moves the menu off the taskbar if WinForms put it there.
+    ///
+    /// NotifyIcon hands the menu to ContextMenuStrip.ShowInTaskbar, which clears the drop-down's "keep
+    /// inside the working area" flag on purpose - its comment says "this will allow us to overlap the
+    /// system tray". The menu is then placed with its bottom-right corner on the pointer, and the
+    /// pointer is on the taskbar, so its last items land under the taskbar. That is the whole problem:
+    /// the taskbar is topmost too and re-raises itself while the pointer is on it. The shell's own tray
+    /// menu never overlaps the taskbar, so this moves ours clear of it, by as little as it can.
+    /// </summary>
+    private void KeepMenuOffTaskbar()
+    {
+        if (!_settings.MenuAvoidTaskbar)
+            return;
+
+        if (!WindowZOrder.TryGetTaskbarRect(out var taskbar, out var edge))
+            return;
+
+        var bounds = _menu.Bounds;
+        var screen = Screen.FromRectangle(bounds).Bounds;
+        var gap = Math.Max(_settings.MenuTaskbarGap, 0);
+
+        switch (edge)
+        {
+            case TaskbarEdge.Bottom when bounds.Bottom > taskbar.Top - gap:
+                bounds.Y = taskbar.Top - bounds.Height - gap;
+                bounds.Y = Math.Max(bounds.Y, screen.Top);
+                break;
+            case TaskbarEdge.Top when bounds.Top < taskbar.Bottom + gap:
+                bounds.Y = taskbar.Bottom + gap;
+                bounds.Y = Math.Min(bounds.Y, screen.Bottom - bounds.Height);
+                break;
+            case TaskbarEdge.Left when bounds.Left < taskbar.Right + gap:
+                bounds.X = taskbar.Right + gap;
+                bounds.X = Math.Min(bounds.X, screen.Right - bounds.Width);
+                break;
+            case TaskbarEdge.Right when bounds.Right > taskbar.Left - gap:
+                bounds.X = taskbar.Left - bounds.Width - gap;
+                bounds.X = Math.Max(bounds.X, screen.Left);
+                break;
+            default:
+                return;
+        }
+
+        _menu.Bounds = bounds;
+
+        if (_settings.MenuKeepTopMost)
+            WindowZOrder.RaiseToTopMost(_menu.Handle);
     }
 
     private void RefreshMenuSafe()
@@ -169,13 +837,18 @@ public sealed class TrayAppContext : ApplicationContext
 
     private void RefreshMenu()
     {
+        // Independent of which monitor is connected, so they are built even when none is found.
+        BuildStartMenuSizeSubmenu();
+        BuildTrayMenuSubmenu();
+        BuildAdvancedSubmenu();
+
         var monitors = _displayService.GetAllMonitors();
         var target = FindTargetMonitor(monitors);
 
         if (target is null)
         {
-            _statusItem.Text = $"未找到匹配 “{_settings.TargetMonitorNameFilter}” 的显示器";
-            _connectToggleItem.Text = "断开 / 连接 (未找到)";
+            _statusItem.Text = "未匹配";
+            _connectToggleItem.Text = "断开 / 连接 (未匹配)";
             _connectToggleItem.Enabled = false;
             _displayModeMenuItem.Enabled = false;
             _displayModeMenuItem.DropDownItems.Clear();
@@ -185,7 +858,7 @@ public sealed class TrayAppContext : ApplicationContext
             _brightnessMenuItem.DropDownItems.Clear();
             _volumeMenuItem.Enabled = false;
             _volumeMenuItem.DropDownItems.Clear();
-            _trayIcon.Text = "移动显示器控制器 - 未找到 DP 显示器";
+            _trayIcon.Text = "移动显示器控制器 - 未匹配";
             return;
         }
 
@@ -655,6 +1328,373 @@ public sealed class TrayAppContext : ApplicationContext
         _monitorControlService.ReleaseHandle(handle.Value);
     }
 
+    /// <summary>
+    /// Sizes offered for the Start menu, in DIP, and 0 standing for "what Windows would have used".
+    ///
+    /// The width list is the range this machine can actually show, not a round number. Measured on a 150%
+    /// display: 400 DIP arrives as a 600 px panel and 700 as 1052 px, while anything under about 325 DIP stops
+    /// the Start menu drawing at all - and it stays broken until the shell hosts restart (see the hook's
+    /// kMinWidth). 350 is therefore the narrow end, and Windows' own default measures 668 x 716 DIP here, so
+    /// 700 is the wide end.
+    /// </summary>
+    private static readonly int[] StartMenuWidthPresets = { 0, 350, 400, 450, 500, 550, 600, 650, 700 };
+
+    private static readonly int[] StartMenuHeightPresets = { 0, 600, 650, 700, 750, 890, 1000 };
+
+    /// <summary>
+    /// Whole sizes, all of them inside the same width range the 宽度 entry offers - a preset that exceeds it
+    /// would quietly contradict the limit next to it.
+    /// </summary>
+    private static readonly (string Label, int Width, int Height)[] StartMenuSizePresets =
+    {
+        ("很窄 (350×700)", 350, 700),
+        ("窄 (400×750)", 400, 750),
+        ("中 (500×890)", 500, 890),
+        ("宽 (650×1000)", 650, 1000),
+    };
+
+    /// <summary>
+    /// The narrowest width this app will write, and the same limit the hook enforces on anything that arrives
+    /// another way - a hand-edited ini file, for instance, cannot put the Start menu into a state it cannot
+    /// draw (see the hook's kMinWidth for what was measured).
+    /// </summary>
+    private const int StartMenuMinimumWidth = StartMenuSizeSettings.MinimumWidth;
+
+    private const int StartMenuMaximumWidth = StartMenuSizeSettings.MaximumWidth;
+
+    private const int StartMenuMaximumHeight = StartMenuSizeSettings.MaximumHeight;
+
+    /// <summary>
+    /// The Start menu's size, as the injected hook reads it. Writing the file is all it takes: the hook
+    /// re-reads it every time the menu is opened, so the change lands on the next open with no re-injection.
+    /// </summary>
+    private void BuildStartMenuSizeSubmenu()
+    {
+        var size = StartMenuSizeSettings.Load();
+
+        _startMenuSizeMenuItem.DropDownItems.Clear();
+
+        _startMenuSizeMenuItem.DropDownItems.Add(new ToolStripMenuItem(
+            $"当前: {DescribeStartMenuSize(size.Width)} × {DescribeStartMenuSize(size.Height)} — {StartMenuHookInstaller.DescribeAttachment()}")
+        {
+            Enabled = false,
+        });
+
+        _startMenuSizeMenuItem.DropDownItems.Add(new ToolStripSeparator());
+
+        _startMenuSizeMenuItem.DropDownItems.Add(BuildStartMenuValueMenu(
+            "宽度", size.Width, StartMenuWidthPresets, StartMenuMinimumWidth, StartMenuMaximumWidth, SetStartMenuWidth));
+
+        _startMenuSizeMenuItem.DropDownItems.Add(BuildStartMenuValueMenu(
+            "高度", size.Height, StartMenuHeightPresets, 0, StartMenuMaximumHeight, SetStartMenuHeight));
+
+        var presetsItem = new ToolStripMenuItem("预设尺寸");
+        foreach (var (label, width, height) in StartMenuSizePresets)
+        {
+            var (presetWidth, presetHeight) = (width, height);
+            var item = new ToolStripMenuItem(label)
+            {
+                Checked = size.Width == presetWidth && size.Height == presetHeight,
+            };
+            item.Click += (_, _) => SetStartMenuSize(presetWidth, presetHeight);
+            presetsItem.DropDownItems.Add(item);
+        }
+        _startMenuSizeMenuItem.DropDownItems.Add(presetsItem);
+
+        var resetItem = new ToolStripMenuItem("还原系统默认尺寸") { Enabled = !size.IsSystemDefault };
+        resetItem.Click += (_, _) => SetStartMenuSize(0, 0);
+        _startMenuSizeMenuItem.DropDownItems.Add(resetItem);
+
+        _startMenuSizeMenuItem.DropDownItems.Add(new ToolStripSeparator());
+
+        var attachItem = new ToolStripMenuItem("把钩子注入开始菜单进程");
+        attachItem.Click += (_, _) => AttachStartMenuHook();
+        _startMenuSizeMenuItem.DropDownItems.Add(attachItem);
+
+        var reattachItem = new ToolStripMenuItem("重启开始菜单进程并重新注入");
+        reattachItem.Click += (_, _) => RestartHostsAndAttach();
+        _startMenuSizeMenuItem.DropDownItems.Add(reattachItem);
+
+        var clearLogItem = new ToolStripMenuItem("清空钩子日志");
+        clearLogItem.Click += (_, _) => ClearStartMenuHookLog();
+        _startMenuSizeMenuItem.DropDownItems.Add(clearLogItem);
+    }
+
+    /// <summary>
+    /// One "宽度"-style entry: the preset numbers, then a custom one. The current value is ticked, so the
+    /// line reads as a state rather than a set of buttons. <paramref name="minimum"/> is a real limit - the
+    /// hook clamps to it - and not a suggestion, so the prompt does not offer anything below it.
+    /// </summary>
+    private ToolStripMenuItem BuildStartMenuValueMenu(string title, int current, int[] presets,
+        int minimum, int maximum, Action<int> apply)
+    {
+        var menu = new ToolStripMenuItem($"{title} (当前 {DescribeStartMenuSize(current)})");
+
+        foreach (var value in presets)
+        {
+            var preset = value;
+            var item = new ToolStripMenuItem(DescribeStartMenuSize(preset)) { Checked = current == preset };
+            item.Click += (_, _) => apply(preset);
+            menu.DropDownItems.Add(item);
+        }
+
+        var customItem = new ToolStripMenuItem("自定义…");
+        customItem.Click += (_, _) =>
+        {
+            var initial = Math.Clamp(current, minimum, maximum);
+            if (AskForNumber($"开始菜单{title}", $"{title} (DIP, {minimum}~{maximum}):", initial, minimum, maximum) is { } entered)
+                apply(entered);
+        };
+
+        menu.DropDownItems.Add(new ToolStripSeparator());
+        menu.DropDownItems.Add(customItem);
+
+        return menu;
+    }
+
+    private static string DescribeStartMenuSize(int value)
+        => value <= 0 ? "系统默认" : value.ToString();
+
+    private void SetStartMenuWidth(int width)
+        => SetStartMenuSize(width, StartMenuSizeSettings.Load().Height);
+
+    private void SetStartMenuHeight(int height)
+        => SetStartMenuSize(StartMenuSizeSettings.Load().Width, height);
+
+    private void SetStartMenuSize(int width, int height)
+    {
+        var size = new StartMenuSizeSettings { Width = width, Height = height };
+
+        if (!size.Save(out var error))
+        {
+            ShowBalloon("开始菜单尺寸", error, ToolTipIcon.Error);
+            return;
+        }
+
+        DebugLog.Write($"start menu size: set to {(size.IsSystemDefault ? "system default" : $"{width}x{height}")}");
+
+        var what = size.IsSystemDefault ? "已还原系统默认尺寸" : $"已设置为 {width}×{height}";
+        ShowBalloon("开始菜单尺寸", $"{what}(下次打开开始菜单时生效) — {StartMenuHookInstaller.DescribeAttachment()}", ToolTipIcon.Info);
+
+        RefreshMenu();
+    }
+
+    private void AttachStartMenuHook()
+    {
+        var library = StartMenuHookInstaller.FindLibrary();
+        DebugLog.Write($"start menu hook: attaching {library ?? "(no library found)"}");
+
+        var attached = StartMenuHookInstaller.Attach(out var report);
+
+        ShowBalloon("开始菜单尺寸",
+            attached ? $"{report},打开开始菜单就能看到尺寸生效" : report,
+            attached ? ToolTipIcon.Info : ToolTipIcon.Error);
+
+        RefreshMenu();
+    }
+
+    /// <summary>
+    /// Restarts the shell's Start-menu hosts and then injects.
+    ///
+    /// A DLL that is already in a process cannot be unloaded from outside it, and it cannot be replaced
+    /// either - so a rebuilt hook would either be ignored (the old copy does all the work) or, worse, loaded
+    /// next to the old one. Restarting the hosts clears both problems; the shell starts them again by itself.
+    /// </summary>
+    private void RestartHostsAndAttach()
+    {
+        DebugLog.Write("start menu hook: restarting the shell hosts to drop the loaded hook");
+
+        StartMenuHookInstaller.RestartHosts(out var restartReport);
+        var attached = StartMenuHookInstaller.Attach(out var attachReport);
+
+        ShowBalloon("开始菜单尺寸",
+            attached ? $"{restartReport},{attachReport}" : $"{restartReport} — {attachReport}",
+            attached ? ToolTipIcon.Info : ToolTipIcon.Error);
+
+        RefreshMenu();
+    }
+
+    private void ClearStartMenuHookLog()
+    {
+        try
+        {
+            if (File.Exists(StartMenuSizeSettings.LogPath))
+                File.Delete(StartMenuSizeSettings.LogPath);
+        }
+        catch (Exception ex)
+        {
+            DebugLog.Write($"start menu hook: could not clear the log: {ex.Message}");
+        }
+
+        RefreshMenu();
+    }
+
+    /// <summary>
+    /// The tray menu's own behaviour - the things that used to be constants while its placement against the
+    /// taskbar and the shell's panels was being worked out.
+    /// </summary>
+    private void BuildTrayMenuSubmenu()
+    {
+        _trayMenuMenuItem.DropDownItems.Clear();
+
+        var avoidItem = new ToolStripMenuItem("避让任务栏(菜单不压住任务栏)")
+        {
+            CheckOnClick = true,
+            Checked = _settings.MenuAvoidTaskbar,
+        };
+        avoidItem.Click += (_, _) => UpdateMenuBehaviour(s => s.MenuAvoidTaskbar = avoidItem.Checked);
+        _trayMenuMenuItem.DropDownItems.Add(avoidItem);
+
+        _trayMenuMenuItem.DropDownItems.Add(BuildTrayMenuValueMenu(
+            "与任务栏间距", _settings.MenuTaskbarGap, new[] { 0, 1, 4, 8, 16 }, "像素",
+            value => UpdateMenuBehaviour(s => s.MenuTaskbarGap = value)));
+
+        var deferItem = new ToolStripMenuItem("打开前先等开始菜单/搜索面板关掉")
+        {
+            CheckOnClick = true,
+            Checked = _settings.MenuDeferWhileShellPanel,
+        };
+        deferItem.Click += (_, _) => UpdateMenuBehaviour(s => s.MenuDeferWhileShellPanel = deferItem.Checked);
+        _trayMenuMenuItem.DropDownItems.Add(deferItem);
+
+        _trayMenuMenuItem.DropDownItems.Add(BuildTrayMenuValueMenu(
+            "等面板消失最多等", _settings.MenuPanelWaitMs, new[] { 1000, 2000, 3000, 5000 }, "毫秒",
+            value => UpdateMenuBehaviour(s => s.MenuPanelWaitMs = value)));
+
+        _trayMenuMenuItem.DropDownItems.Add(BuildTrayMenuValueMenu(
+            "面板消失后的宽限时间", _settings.MenuShellPanelGraceMs, new[] { 150, 350, 600, 1000 }, "毫秒",
+            value => UpdateMenuBehaviour(s => s.MenuShellPanelGraceMs = value)));
+
+        var topMostItem = new ToolStripMenuItem("定时保持在最前")
+        {
+            CheckOnClick = true,
+            Checked = _settings.MenuKeepTopMost,
+        };
+        topMostItem.Click += (_, _) => UpdateMenuBehaviour(s => s.MenuKeepTopMost = topMostItem.Checked);
+        _trayMenuMenuItem.DropDownItems.Add(topMostItem);
+    }
+
+    private ToolStripMenuItem BuildTrayMenuValueMenu(string title, int current, int[] presets, string unit, Action<int> apply)
+    {
+        var menu = new ToolStripMenuItem($"{title} (当前 {current} {unit})");
+
+        foreach (var value in presets)
+        {
+            var preset = value;
+            var item = new ToolStripMenuItem($"{preset} {unit}") { Checked = current == preset };
+            item.Click += (_, _) => apply(preset);
+            menu.DropDownItems.Add(item);
+        }
+
+        var customItem = new ToolStripMenuItem("自定义…");
+        customItem.Click += (_, _) =>
+        {
+            if (AskForNumber(title, $"{title} ({unit}, 0 以上):", current, 0, 60000) is { } entered)
+                apply(entered);
+        };
+
+        menu.DropDownItems.Add(new ToolStripSeparator());
+        menu.DropDownItems.Add(customItem);
+
+        return menu;
+    }
+
+    /// <summary>Changes one of the tray menu's own settings and saves it, so it survives a restart.</summary>
+    private void UpdateMenuBehaviour(Action<AppSettings> change)
+    {
+        change(_settings);
+        _settings.Save();
+        DebugLog.Write($"tray menu behaviour: avoid={_settings.MenuAvoidTaskbar} gap={_settings.MenuTaskbarGap} " +
+                       $"defer={_settings.MenuDeferWhileShellPanel} wait={_settings.MenuPanelWaitMs}ms " +
+                       $"grace={_settings.MenuShellPanelGraceMs}ms topmost={_settings.MenuKeepTopMost}");
+        RefreshMenu();
+    }
+
+    /// <summary>
+    /// The settings and files that are not part of any other submenu: which monitor counts as "the" monitor,
+    /// and where the things this app writes actually are.
+    /// </summary>
+    private void BuildAdvancedSubmenu()
+    {
+        _advancedMenuItem.DropDownItems.Clear();
+
+        var filterItem = new ToolStripMenuItem($"显示器名称匹配关键字: {_settings.TargetMonitorNameFilter}");
+        filterItem.Click += (_, _) => PromptForMonitorFilter();
+        _advancedMenuItem.DropDownItems.Add(filterItem);
+
+        _advancedMenuItem.DropDownItems.Add(new ToolStripMenuItem(
+            $"已识别的显示器: {_settings.TargetMonitorKey ?? "(未记录)"}")
+        {
+            Enabled = false,
+        });
+
+        _advancedMenuItem.DropDownItems.Add(new ToolStripSeparator());
+
+        _advancedMenuItem.DropDownItems.Add(BuildOpenItem("打开应用配置文件夹", SettingsFolderPath));
+        _advancedMenuItem.DropDownItems.Add(BuildOpenItem("打开开始菜单钩子文件夹", StartMenuSizeSettings.FolderPath));
+        _advancedMenuItem.DropDownItems.Add(BuildOpenItem("打开应用日志", DebugLog.LogPath));
+        _advancedMenuItem.DropDownItems.Add(BuildOpenItem("打开开始菜单钩子日志", StartMenuSizeSettings.LogPath));
+    }
+
+    private ToolStripMenuItem BuildOpenItem(string title, string path)
+    {
+        var item = new ToolStripMenuItem(title);
+        item.Click += (_, _) => OpenInExplorer(path);
+        return item;
+    }
+
+    private static string SettingsFolderPath
+        => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "MobDisplayController");
+
+    private void OpenInExplorer(string path)
+    {
+        try
+        {
+            if (!File.Exists(path) && !Directory.Exists(path))
+            {
+                ShowBalloon("打开失败", $"还没有这个文件或文件夹: {path}", ToolTipIcon.Warning);
+                return;
+            }
+
+            Process.Start(new ProcessStartInfo { FileName = path, UseShellExecute = true });
+        }
+        catch (Exception ex)
+        {
+            ShowBalloon("打开失败", ex.Message, ToolTipIcon.Error);
+        }
+    }
+
+    private void PromptForMonitorFilter()
+    {
+        var entered = AskForText("显示器名称匹配关键字",
+            "显示器的友好名称里包含它就选中它 (例如 DP / HDMI):", _settings.TargetMonitorNameFilter);
+
+        if (entered is null)
+            return;
+
+        _settings.TargetMonitorNameFilter = entered;
+        _settings.Save();
+        RefreshMenu();
+    }
+
+    /// <summary>
+    /// Asks for a value with the menu out of the way first.
+    ///
+    /// The menu cannot be the dialog's owner: TopMostMenu forces WS_EX_TOPMOST on it, so it would draw over
+    /// the dialog it owns. Closing it first and leaving the dialog unowned is what puts the dialog in front.
+    /// </summary>
+    private int? AskForNumber(string title, string label, int initial, int minimum, int maximum)
+    {
+        _menu.Close();
+        return InputPromptForm.AskNumber(null, title, label, initial, minimum, maximum);
+    }
+
+    private string? AskForText(string title, string label, string initial)
+    {
+        _menu.Close();
+        return InputPromptForm.AskText(null, title, label, initial);
+    }
+
     private void ToggleTargetMonitor()
     {
         var monitors = _displayService.GetAllMonitors();
@@ -757,6 +1797,8 @@ public sealed class TrayAppContext : ApplicationContext
 
         _recoveryHotkey?.Dispose();
         _layoutHotkey?.Dispose();
+        _menuHotkey?.Dispose();
+        _iconHealthTimer.Dispose();
 
         _trayIcon.Visible = false;
         _trayIcon.Dispose();

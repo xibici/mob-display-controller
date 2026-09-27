@@ -10,7 +10,7 @@ public static class DebugLog
 {
     private static readonly object Gate = new();
 
-    private static string LogPath
+    public static string LogPath
     {
         get
         {
