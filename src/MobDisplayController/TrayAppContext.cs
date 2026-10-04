@@ -234,6 +234,30 @@ public sealed class TrayAppContext : ApplicationContext
             // a flicker and removes the wait for OnIconHealthCheck.
             DebugLog.Write("display settings changed - re-adding the tray icon");
             ReRegisterTrayIcon();
+
+            // Windows can land back in Clone on its own - a wake, a reconnect, a driver reset - without
+            // ever going through TrySwitchLayout. The menu already refuses to let a user leave the
+            // external panel rotated while cloned (see BuildRotationSubmenu), so that's the invariant to
+            // restore here too, not just the state the app itself last set.
+            if (_displayService.GetTopologyMode() == DisplayService.TopologyMode.Clone)
+            {
+                if (_displayService.TryNormalizeExternalRotation(out var rotationError))
+                    DebugLog.Write("display settings changed: external rotation re-normalised to 0 (clone)");
+                else
+                    DebugLog.Write($"display settings changed: external rotation left as Windows set it ({rotationError})");
+            }
+
+            // Opportunistically refreshes the DPI baseline TrySwitchLayout restores from. The power
+            // button's own press is only reported after Windows has already carried out the real
+            // suspend/resume round trip (the filter driver's event fires on completion, and the
+            // Kernel-Power 506 log entry is written after the fact too) - by the time that signal
+            // reaches OnPowerButtonPressed, a capture taken right there is already reading whatever
+            // DPI the resume itself landed on, not the pre-sleep value. Catching it here instead, on
+            // every mode change during the day (cloned or not), means a real, fresh baseline is
+            // usually already on hand well before any sleep happens.
+            var monitorsNow = _displayService.GetAllMonitors();
+            _displayService.CaptureModeBaseline(monitorsNow);
+            _displayService.CaptureDpiScaleBaseline(monitorsNow);
         };
 
         // Reconcile the on-disk autostart preference with what's actually in the registry.
@@ -272,6 +296,24 @@ public sealed class TrayAppContext : ApplicationContext
         // against the setting having drifted back (e.g. a Windows update reset power schemes).
         if (_settings.PowerButtonTakeoverEnabled)
             ApplyPowerButtonTakeover(true);
+
+        // Same reconciliation, for rotation: if Windows already has the screens cloned by the time
+        // this process starts (a boot, a wake, a reconnect that happened before we were running to see
+        // DisplaySettingsChanged for it), the external panel can already be carrying the built-in's
+        // 90 degrees with nothing left to fire the fix. Checking once here closes that gap.
+        if (_displayService.GetTopologyMode() == DisplayService.TopologyMode.Clone)
+        {
+            if (_displayService.TryNormalizeExternalRotation(out var startupRotationError))
+                DebugLog.Write("startup: already cloned - external rotation normalised to 0");
+            else
+                DebugLog.Write($"startup: already cloned - external rotation left as Windows set it ({startupRotationError})");
+        }
+
+        // Whatever is active right now is as good a baseline as any to start the DPI cache with -
+        // without it, the very first switch of the session has nothing to restore from.
+        var monitorsAtStart = _displayService.GetAllMonitors();
+        _displayService.CaptureModeBaseline(monitorsAtStart);
+        _displayService.CaptureDpiScaleBaseline(monitorsAtStart);
     }
 
     /// <summary>
@@ -932,19 +974,26 @@ public sealed class TrayAppContext : ApplicationContext
     }
 
     /// <summary>
-    /// Switches layouts, and nothing else: the mode Windows picks for the new topology is left alone.
+    /// Switches layouts, then puts the monitor that stays active back on the resolution, refresh rate
+    /// and DPI scale it had before: switching screens on and off should not also re-zoom them.
     ///
-    /// This used to capture the current mode first and put it back afterwards, so that a switch could
-    /// never move the resolution. That turned out to be worse than the problem it solved: putting a
-    /// mode back goes through ChangeDisplaySettingsEx with CDS_UPDATEREGISTRY, which *writes the mode
-    /// into the registry for that display* - so whatever the desktop happened to be at while a switch
-    /// ran became what Windows restores at every boot. There is no resolution feature in this app any
-    /// more - not automatic and not manual - so nothing here can write a mode.
+    /// An earlier version restored the mode through ChangeDisplaySettingsEx with CDS_UPDATEREGISTRY,
+    /// which *writes the mode into the registry for that display* - so whatever the desktop happened
+    /// to be at while a switch ran became what Windows restored at every boot (a rotated duplicate's
+    /// 1200-wide surface). It was removed for that. The mode is restored again now, but with
+    /// dwFlags 0 (this session only, nothing written) and refusing a portrait/landscape flip; see
+    /// <see cref="DisplayService.TrySetMode"/>. Do not add CDS_UPDATEREGISTRY back.
     /// </summary>
     private bool TrySwitchLayout(DisplayService.TopologyMode mode, out string error)
     {
-        // Read only. This is what says whether Windows moved the mode, without the app deciding it.
         var before = GetDesktopMode();
+
+        // Captured while each monitor still has the source it had a moment ago - once the topology
+        // below is applied, Windows is free to hand the new one a mode and DPI scale of its own
+        // choosing.
+        var monitorsBefore = _displayService.GetAllMonitors();
+        _displayService.CaptureModeBaseline(monitorsBefore);
+        _displayService.CaptureDpiScaleBaseline(monitorsBefore);
 
         if (!_displayService.TrySetTopology(mode, out error))
             return false;
@@ -960,6 +1009,18 @@ public sealed class TrayAppContext : ApplicationContext
             else
                 DebugLog.Write($"duplicate: external rotation left as Windows set it ({rotationError})");
         }
+
+        // Re-read monitors now that the switch is done: a dedicated source's id and GDI name can
+        // change when the topology does, so they have to come from after this point, not from the
+        // list captured above. Mode first, then DPI: the scale steps a source offers depend on the
+        // mode it is running.
+        var monitorsAfter = _displayService.GetAllMonitors();
+        foreach (var line in _displayService.RestoreModeBaseline(monitorsAfter))
+            DebugLog.Write($"switch: {line}");
+
+        monitorsAfter = _displayService.GetAllMonitors();
+        foreach (var line in _displayService.RestoreDpiScaleBaseline(monitorsAfter))
+            DebugLog.Write($"switch: {line}");
 
         if (GetDesktopMode() is { } after)
         {

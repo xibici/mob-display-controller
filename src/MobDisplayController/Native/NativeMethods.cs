@@ -117,6 +117,35 @@ internal enum DISPLAYCONFIG_DEVICE_INFO_TYPE : uint
     DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_PREFERRED_MODE = 3,
     DISPLAYCONFIG_DEVICE_INFO_GET_ADAPTER_NAME = 4,
     DISPLAYCONFIG_DEVICE_INFO_SET_TARGET_PERSISTENCE = 5,
+
+    // Undocumented (not in wingdi.h) but stable since Win10 1703 - the same pair Settings' own
+    // display-scaling slider uses. Found via the per-monitor DPI community samples, since MS
+    // never shipped a public API for "read/write this monitor's own scale percentage".
+    DISPLAYCONFIG_DEVICE_INFO_GET_DPI_SCALE = unchecked((uint)-3),
+    DISPLAYCONFIG_DEVICE_INFO_SET_DPI_SCALE = unchecked((uint)-4),
+}
+
+/// <summary>
+/// Not a percentage - Windows doesn't hand that out through this call, only where the current
+/// choice sits in its own internal list of candidate scales for this source, relative to the
+/// one it would pick by itself (0 = "recommended", negative = smaller, positive = larger). Good
+/// enough to capture one of these before a topology switch and set the same one back after,
+/// without ever knowing what percentage it actually corresponds to.
+/// </summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct DISPLAYCONFIG_SOURCE_DPI_SCALE_GET
+{
+    public DISPLAYCONFIG_DEVICE_INFO_HEADER header;
+    public int minScaleRel;
+    public int curScaleRel;
+    public int maxScaleRel;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct DISPLAYCONFIG_SOURCE_DPI_SCALE_SET
+{
+    public DISPLAYCONFIG_DEVICE_INFO_HEADER header;
+    public int scaleRel;
 }
 
 [StructLayout(LayoutKind.Sequential)]
@@ -213,6 +242,12 @@ internal static class Ccd
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     public static extern int DisplayConfigGetDeviceInfo(ref DISPLAYCONFIG_SOURCE_DEVICE_NAME requestPacket);
+
+    [DllImport("user32.dll")]
+    public static extern int DisplayConfigGetDeviceInfo(ref DISPLAYCONFIG_SOURCE_DPI_SCALE_GET requestPacket);
+
+    [DllImport("user32.dll")]
+    public static extern int DisplayConfigSetDeviceInfo(ref DISPLAYCONFIG_SOURCE_DPI_SCALE_SET requestPacket);
 }
 
 #endregion
@@ -310,6 +345,22 @@ internal static class Gdi
         int iModeNum,
         ref DEVMODE lpDevMode,
         uint dwFlags);
+
+    public const int DM_PELSWIDTH = 0x00080000;
+    public const int DM_PELSHEIGHT = 0x00100000;
+    public const int DM_DISPLAYFREQUENCY = 0x00400000;
+    public const int DISP_CHANGE_SUCCESSFUL = 0;
+
+    // The only write in this file. dwFlags must stay 0 (dynamic, this session only): the
+    // CDS_UPDATEREGISTRY flag is deliberately not declared here, because it is what once wrote a
+    // layout-switch mode into the boot-time registry default (see README "程序不会设置分辨率").
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    public static extern int ChangeDisplaySettingsEx(
+        string lpszDeviceName,
+        ref DEVMODE lpDevMode,
+        IntPtr hwnd,
+        uint dwflags,
+        IntPtr lParam);
 }
 
 #endregion
@@ -371,6 +422,33 @@ internal static class MonitorApi
     public const byte VCP_CONTRAST = 0x12;
     public const byte VCP_AUDIO_VOLUME = 0x62;
     public const byte VCP_POWER_MODE = 0xD6;
+
+    [DllImport("shcore.dll")]
+    public static extern int GetDpiForMonitor(IntPtr hMonitor, MONITOR_DPI_TYPE dpiType, out uint dpiX, out uint dpiY);
+
+    /// <summary>Finds the HMONITOR currently showing on a given GDI device name (e.g. \\.\DISPLAY2), or null if none does right now.</summary>
+    public static IntPtr? FindMonitorHandle(string gdiDeviceName)
+    {
+        IntPtr? hMonitor = null;
+
+        EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, (IntPtr hMon, IntPtr hdc, ref RECT rect, IntPtr data) =>
+        {
+            var info = new MONITORINFOEX { cbSize = Marshal.SizeOf<MONITORINFOEX>() };
+            if (GetMonitorInfo(hMon, ref info) && string.Equals(info.szDevice, gdiDeviceName, StringComparison.OrdinalIgnoreCase))
+            {
+                hMonitor = hMon;
+                return false; // stop enumeration
+            }
+            return true;
+        }, IntPtr.Zero);
+
+        return hMonitor;
+    }
+}
+
+internal enum MONITOR_DPI_TYPE
+{
+    MDT_EFFECTIVE_DPI = 0,
 }
 
 #endregion

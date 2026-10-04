@@ -55,10 +55,12 @@ src/MobDisplayController/
 - DDC/CI 依赖硬件支持,如果亮度/音量菜单显示为灰色,说明该便携屏或连接方式不支持这两项。
 - 目前面向单显示器场景优化(一台"DP"便携屏);如果你有多台同名显示器,请在设置里通过下拉框精确选择,程序会记住其唯一 ID 而不仅仅是名字。
 
-## 程序不会设置分辨率
+## 切换时分辨率和缩放保持不变
 
-**程序里已经没有任何分辨率功能:** 没有分辨率菜单、也没有自动设置。`显示模式` 菜单(以及电源键、`Ctrl+Alt+Shift+L`)只切换拓扑,分辨率完全交给 Windows ✓。唯一一处"自动"的动作是复制模式切换后把外屏**旋转**归零 —— 旋转不是分辨率 ✓。
+`显示模式` 菜单、电源键、`Ctrl+Alt+Shift+L` 切换拓扑时,程序会在切换前记下每块屏的**分辨率+刷新率**和**缩放(DPI)**,切完把仍然亮着的那块屏放回去:复制(双屏)是什么,切到仅外屏后外屏就是什么。复制模式下旋转也会把外屏归零。
 
-之前不是这样:切换前会先记下当前分辨率,切完再"放回去",以免复制模式把桌面掉到两块屏共享的分辨率上。但这个"放回去"走的是 `ChangeDisplaySettingsEx` + `CDS_UPDATEREGISTRY` —— **它会把分辨率写进注册表**,而复制模式下记下的那个分辨率是"旋转后的共享源"(宽度 1200),于是每次开机 Windows 都恢复成这个不存在的尺寸 ✗。
+**分辨率"放回去"只在本次会话生效,绝不写注册表。** 这是有历史教训的:更早的版本用 `ChangeDisplaySettingsEx` + `CDS_UPDATEREGISTRY` 放回分辨率,它**会把分辨率写进注册表**,而复制模式下记下的是"旋转后的共享源"(宽度 1200),于是每次开机 Windows 都恢复成这个不存在的尺寸 ✗。现在 `dwFlags` 固定为 0(`Native/NativeMethods.cs` 里连 `CDS_UPDATEREGISTRY` 常量都没声明,防止误用),并且拒绝横竖方向不一致的还原。**不要把 `CDS_UPDATEREGISTRY` 加回来。**
 
-自动设置和手动分辨率菜单现在都已删除 ✓。历史遗留的坏配置在 `HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers\Configuration` 下,把 `PrimSurfSize.cx` 为 1200 的那几个键删掉即可(Windows 会自己重建),删之前先导出备份。日志里 `switch: mode untouched at ...` / `switch: Windows moved the mode ...` 会告诉你切换时 Windows 有没有动分辨率 —— 只读,不改 ✗。
+- 复制模式本身不还原分辨率:复制的模式由两块屏都支持的最高刷新率决定(内屏不支持 120Hz,外屏单独时才能 120Hz),硬要求会被 Windows 悄悄改回去。以复制里的模式为准,切到仅外屏时外屏保持它。
+- 缩放用有文档的 `GetDpiForMonitor` 读真实 DPI,再逐档试 CCD 的相对缩放档位直到命中,找不到就退回 Windows 原来选的档位。基线在每次切换前、显示设置变化时、启动时刷新。
+- 历史遗留的坏配置在 `HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers\Configuration` 下,把 `PrimSurfSize.cx` 为 1200 的键删掉即可(Windows 会自己重建),删之前先导出备份。日志里 `switch: 分辨率还原…` / `switch: 缩放还原…` / `switch: Windows moved the mode …` 会告诉你每次切换做了什么。
